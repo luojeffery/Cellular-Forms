@@ -40,8 +40,8 @@ def impl_glfw_init():
 		print("Could not initialize OpenGL context")
 		sys.exit(1)
 
-	glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 3)
-	glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 3)
+	glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
+	glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 6)
 	glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
 
 	glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, GL_TRUE)
@@ -81,6 +81,12 @@ def main():
 	shader_lighting_pass = Shader("ssao.vs", "ssao_lighting.fs")
 	shader_ssao = Shader("ssao.vs", "ssao.fs")
 	shader_ssao_blur = Shader("ssao.vs", "ssao_blur.fs")
+
+	# load compute shader
+	#with open("cells_compute.cs", "r") as file:
+	#	compute_shader_code = file.read()
+	#compute_shader = glCreateShader(GL_COMPUTE_SHADER)
+
 
 	# Load models
 	backpack = Model("objects/backpack/backpack.obj")
