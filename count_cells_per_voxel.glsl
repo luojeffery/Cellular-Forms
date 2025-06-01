@@ -2,13 +2,16 @@
 layout(local_size_x = 256) in;
 
 struct Cell {
-    vec3 position;
-    float foodLevel;
-    int linkStartIndex;
-    int linkCount;
-    float radius;
-    float padding;
+    vec3 position;       // 16 bytes (vec3 + padding)
+    float foodLevel;     // 4  (included in above 16)
+    vec3 voxelCoord;     // 16 bytes
+    float radius;        // 4
+    int linkStartIndex;  // 4
+    int linkCount;       // 4
+    int flatVoxelIndex;  // 4
+    int isActive;        // 4 (to make total = 64)
 };
+
 
 layout(std430, binding = 0) buffer CellBuffer {
     Cell cells[];
@@ -17,24 +20,10 @@ layout(std430, binding = 2) buffer CellCountPerVoxel {
     uint cellCountPerVoxel[];
 };
 
-uniform float voxelSize;
-uniform ivec3 gridResolution;
-
-uvec3 getVoxelCoord(vec3 pos) {
-    return uvec3(floor(pos / voxelSize));
-}
-
-uint flattenVoxelIndex(uvec3 v) {
-    return v.x + v.y * gridResolution.x + v.z * gridResolution.x * gridResolution.y;
-}
-
 void main() {
     uint id = gl_GlobalInvocationID.x;
     if (id >= cells.length()) return;
-
-    uvec3 coord = getVoxelCoord(cells[id].position);
-    if (any(greaterThanEqual(coord, uvec3(gridResolution)))) return;
-
-    uint idx = flattenVoxelIndex(coord);
-    atomicAdd(cellCountPerVoxel[idx], 1);
+    if (cells[id].isActive == 0) return; // skip inactive cells
+    int voxelIdx = cells[id].flatVoxelIndex;
+    atomicAdd(cellCountPerVoxel[voxelIdx], 1); // we found a voxel to be surrounding this cell
 }

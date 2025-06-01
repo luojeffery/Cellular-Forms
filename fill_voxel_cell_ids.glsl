@@ -2,13 +2,17 @@
 layout(local_size_x = 256) in;
 
 struct Cell {
-    vec3 position;
-    float foodLevel;
-    int linkStartIndex;
-    int linkCount;
-    float radius;
-    float padding;
+    vec3 position;       // 16 bytes (vec3 + padding)
+    float foodLevel;     // 4  (included in above 16)
+    uvec3 voxelCoord;     // 16 bytes
+    float radius;        // 4
+    int linkStartIndex;  // 4
+    int linkCount;       // 4
+    int flatVoxelIndex;  // 4
+    int isActive;        // 4 (to make total = 64)
 };
+
+
 
 layout(std430, binding = 0) buffer CellBuffer {
     Cell cells[];
@@ -23,26 +27,20 @@ layout(std430, binding = 4) buffer FlatVoxelCellIDs {
     uint flatVoxelCellIDs[];
 };
 
-uniform float voxelSize;
-uniform ivec3 gridResolution;
+uniform vec3 gridResolution;
 
-uvec3 getVoxelCoord(vec3 pos) {
-    return uvec3(floor(pos / voxelSize));
-}
-
-uint flattenVoxelIndex(uvec3 v) {
-    return v.x + v.y * gridResolution.x + v.z * gridResolution.x * gridResolution.y;
-}
 
 void main() {
-    uint cellID = gl_GlobalInvocationID.x;
-    if (cellID >= cells.length()) return;
-
-    // Determine the voxel this cell falls into
-    uvec3 voxelCoord = getVoxelCoord(cells[cellID].position);
-    if (any(greaterThanEqual(voxelCoord, uvec3(gridResolution)))) return;
-
-    uint voxelIdx = flattenVoxelIndex(voxelCoord);
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= cells.length()) return;
+    if (cells[id].isActive == 0) return; // Skip inactive cells
+    int voxelIdx = cells[id].flatVoxelIndex;
+    if (voxelIdx < 0 || voxelIdx >= gridResolution.x * gridResolution.y * gridResolution.z) {
+        // Invalid voxel index, skip processing
+        return;
+    }
+    // it is necessary to count up the number of cells per voxel. this way we can properly append starting from the
+    // global start index.
 
     // localIndexInVoxel is the index of this cell within its voxel
     uint localIndexInVoxel = atomicAdd(cellCountPerVoxel[voxelIdx], 1);
@@ -51,5 +49,5 @@ void main() {
     uint globalStartIndex = startIndexPerVoxel[voxelIdx];
 
     // Write the cell ID into the voxel's slot in the flat list
-    flatVoxelCellIDs[globalStartIndex + localIndexInVoxel] = cellID;
+    flatVoxelCellIDs[globalStartIndex + localIndexInVoxel] = id;
 }

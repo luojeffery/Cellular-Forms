@@ -1,12 +1,8 @@
 import os
-import numpy as np
-from OpenGL.GL import *
 from PIL import Image
 import trimesh
 from mesh import *
-from pyglm import glm
-import pyglet
-from tqdm import tqdm
+
 
 class Model:
 	def __init__(self, filepath):
@@ -38,25 +34,26 @@ class Model:
 		textures = []
 		if mesh.visual.material:
 			material = mesh.visual.material
-			path = material.image.info["file_path"]  # this is always diffuse
-			type = "texture_diffuse"
-			id = self.texture_from_file(path)
-			textures.append(Texture(id, type, path))
+			if "file_path" in material.image.info:
+				path = material.image.info["file_path"]  # this is always diffuse
+				type = "texture_diffuse"
+				id = self.texture_from_file(path)
+				textures.append(Texture(id, type, path))
 
-			path = r"C:\Users\luoje\Documents\Pycharm Projects\ssao\objects\backpack\specular.jpg"
-			type = "texture_specular"
-			id = self.texture_from_file(path)
-			textures.append(Texture(id, type, path))
+				path = r"objects\backpack\specular.jpg"
+				type = "texture_specular"
+				id = self.texture_from_file(path)
+				textures.append(Texture(id, type, path))
 
-			path = r"C:\Users\luoje\Documents\Pycharm Projects\ssao\objects\backpack\normal.png"
-			id = self.texture_from_file(path)
-			type = "texture_normal"
-			textures.append(Texture(id, type, path))
+				path = r"objects\backpack\normal.png"
+				id = self.texture_from_file(path)
+				type = "texture_normal"
+				textures.append(Texture(id, type, path))
 
-			path = r"C:\Users\luoje\Documents\Pycharm Projects\ssao\objects\backpack\roughness.jpg"
-			id = self.texture_from_file(path)
-			type = "texture_height"
-			textures.append(Texture(id, type, path))
+				path = r"objects\backpack\roughness.jpg"
+				id = self.texture_from_file(path)
+				type = "texture_height"
+				textures.append(Texture(id, type, path))
 
 		return Mesh(vertices, indices, textures)
 
@@ -67,7 +64,6 @@ class Model:
 			print(f"[Error] Could not load texture at path: {path}")
 			return 0
 
-		# determine number of components & convert to a format numpy / GL likes
 		mode = img.mode
 		if mode == 'L':
 			format_gl = GL_RED
@@ -101,6 +97,10 @@ class Model:
 	def draw(self, shader):
 		for mesh in self.meshes:
 			mesh.draw(shader)
+
+	def draw_instanced(self, instances):
+		for mesh in self.meshes:
+			mesh.draw_instanced(instances)
 
 
 if __name__ == "__main__":

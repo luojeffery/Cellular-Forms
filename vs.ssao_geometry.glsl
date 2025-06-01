@@ -1,14 +1,17 @@
 #version 460 core
 
 struct Cell {
-    vec3 position;
-    float foodLevel;
-    vec3 voxelCoord;
-    float radius;
-    int linkStartIndex;
-    int linkCount;
-    int flatVoxelIndex;
+    vec3 position;       // 16 bytes (vec3 + padding)
+    float foodLevel;     // 4  (included in above 16)
+    vec3 voxelCoord;     // 16 bytes
+    float radius;        // 4
+    int linkStartIndex;  // 4
+    int linkCount;       // 4
+    int flatVoxelIndex;  // 4
+    int isActive;        // 4 (to make total = 64)
 };
+
+
 
 layout(std430, binding = 0) buffer CellBuffer {
     Cell cells[];
@@ -32,9 +35,16 @@ uniform mat4 projection;
 void main()
 {
     vec3 finalPosition;
+    Cell cell = cells[gl_InstanceID];
     if (useSSBO) {
-        Cell cell = cells[gl_InstanceID];
-        finalPosition = aPos * cell.radius + cell.position;
+        if (cell.isActive == 0) {
+            finalPosition = vec3(0);
+        }
+        else {
+            vec3 instancePos = cell.position;
+            float radius = cell.radius;
+            finalPosition = aPos * radius + instancePos + vec3(0, 5, 0);
+        }
     }
     else {
         finalPosition = aPos;

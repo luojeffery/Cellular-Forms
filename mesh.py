@@ -82,3 +82,8 @@ class Mesh:
 		glBindVertexArray(0)
 
 		glActiveTexture(GL_TEXTURE0)
+
+	def draw_instanced(self, instance_count):
+		glBindVertexArray(self.VAO)
+		glDrawElementsInstanced(GL_TRIANGLES, self.indices.size, GL_UNSIGNED_INT, None, instance_count)
+		glBindVertexArray(0)
