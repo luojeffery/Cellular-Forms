@@ -39,6 +39,9 @@ class Compute_Shader:
 	def set_int(self, name, value):
 		glUniform1i(glGetUniformLocation(self.program_id, name), value)
 
+	def set_uint(self, name, value):
+		glUniform1ui(glGetUniformLocation(self.program_id, name), value)
+
 	def set_float(self, name, value):
 		glUniform1f(glGetUniformLocation(self.program_id, name), value)
 

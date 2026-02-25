@@ -335,7 +335,8 @@ def main():
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		prefix_sum_voxel_offsets.use()
-		glDispatchCompute((NUM_VOXELS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+		prefix_sum_voxel_offsets.set_uint("numVoxels", NUM_VOXELS)
+		glDispatchCompute(1, 1, 1)  # Only need 1 thread for sequential prefix sum
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		clear_cell_counts.use()  # Clear again for fill
@@ -370,6 +371,8 @@ def main():
 		if division_queue_count > 0:
 			process_division_queue.use()
 			process_division_queue.set_int("numCells", NUM_CELLS)
+			process_division_queue.set_float("voxelSize", VOXEL_SIZE)
+			process_division_queue.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
 			glDispatchCompute(min(int(division_queue_count), MAX_DIVISION_QUEUE) // 256 + 1, 1, 1)
 			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
@@ -394,6 +397,9 @@ def main():
 
 		# Link healing pass
 		link_healing.use()
+		link_healing.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
+		link_healing.set_float("voxelSize", VOXEL_SIZE)
+		link_healing.set_float("linkHealingRadius", 1.2)  # Slightly larger than linkRestLength
 		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
