@@ -1,22 +1,9 @@
 #version 460
 layout(local_size_x = 256) in;
 
-struct Cell {
-    vec3 position;       // 16 bytes (vec3 + padding)
-    float foodLevel;     // 4  (included in above 16)
-    uvec3 voxelCoord;     // 16 bytes
-    float radius;        // 4
-    int linkStartIndex;  // 4
-    int linkCount;       // 4
-    int flatVoxelIndex;  // 4
-    int isActive;        // 4 (to make total = 64)
-};
-
-
-
-layout(std430, binding = 0) buffer CellBuffer {
-    Cell cells[];
-};
+// This is a simple sequential prefix sum that works for any size
+// For small voxel counts (< 1024), this is efficient enough
+// For larger counts, a proper parallel prefix sum would be needed
 
 layout(std430, binding = 2) buffer CellCountPerVoxel {
     uint cellCountPerVoxel[];
@@ -25,31 +12,17 @@ layout(std430, binding = 3) buffer StartIndexPerVoxel {
     uint startIndexPerVoxel[];
 };
 
-shared uint temp[256];
+uniform uint numVoxels;
 
 void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint lid = gl_LocalInvocationID.x;
-
-    if (gid >= cellCountPerVoxel.length())
-        return;
-
-    temp[lid] = cellCountPerVoxel[gid];
-    memoryBarrierShared();
-    barrier();
-
-    for (uint offset = 1; offset < 256; offset *= 2) {
-        uint val = 0;
-        if (lid >= offset)
-            val = temp[lid - offset];
-
-        barrier();
-        temp[lid] += val;
-        barrier();
+    // Only thread 0 computes the prefix sum
+    // This is simple and correct, though not maximally parallel
+    // For typical voxel counts (64-4096), this is fast enough
+    if (gl_GlobalInvocationID.x != 0) return;
+    
+    uint runningSum = 0;
+    for (uint i = 0; i < numVoxels; i++) {
+        startIndexPerVoxel[i] = runningSum;
+        runningSum += cellCountPerVoxel[i];
     }
-
-    if (gid > 0)
-        startIndexPerVoxel[gid] = temp[lid - 1];
-    else
-        startIndexPerVoxel[0] = 0;
 }

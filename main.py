@@ -20,11 +20,17 @@ SCR_WIDTH = 1000
 SCR_HEIGHT = 750
 use_ssao = True
 only_ao = True
-NUM_CELLS = 10000
-NUM_VOXELS = 1000
+NUM_CELLS = 100
+# Force debugging toggles
+enable_spring = True
+enable_bulge = True
+enable_planar = False
+enable_repulsion = True
+NUM_VOXELS = 64  # 4×4×4 grid for smaller cell count
 VOXEL_SIZE = 4
-GRID_RES = int(round(NUM_VOXELS ** (1 / 3)))
+GRID_RES = int(round(NUM_VOXELS ** (1 / 3)))  # Will be 4
 MAX_LINKS = NUM_CELLS * 6  # Estimate
+MAX_DIVISION_QUEUE = 8192  # Maximum divisions per frame
 
 # Camera
 camera = Camera(glm.vec3(0.0, 0.0, 5.0))
@@ -125,7 +131,7 @@ def read_ssbo(buffer_id, dtype, count):
 
 
 def main():
-	global delta_time, last_frame, use_ssao, only_ao
+	global delta_time, last_frame, use_ssao, only_ao, enable_spring, enable_bulge, enable_planar, enable_repulsion
 
 	imgui.create_context()
 	window = impl_glfw_init()
@@ -144,6 +150,10 @@ def main():
 	count_cells_per_voxel = Compute_Shader("count_cells_per_voxel.glsl")
 	prefix_sum_voxel_offsets = Compute_Shader("prefix_sum_voxel_offsets.glsl")
 	fill_voxel_cell_ids = Compute_Shader("fill_voxel_cell_ids.glsl")
+	food_enqueue = Compute_Shader("food_enqueue.glsl")
+	process_division_queue = Compute_Shader("process_division_queue.glsl")
+	recompute_link_count = Compute_Shader("recompute_link_count.glsl")
+	link_healing = Compute_Shader("link_healing.glsl")
 	simulate = Compute_Shader("simulate.glsl")
 
 	shader_geometry_pass = Shader("vs.ssao_geometry.glsl", "fs.ssao_geometry.glsl")
@@ -166,8 +176,9 @@ def main():
 	start_index_per_voxel_ssbo = create_ssbo(binding_index=3, size_in_bytes=NUM_VOXELS * UINT_SIZE)
 	# todo: might have to change this size
 	flat_voxel_cell_ids_ssbo = create_ssbo(binding_index=4, size_in_bytes=NUM_CELLS * 32 * UINT_SIZE)  # assume up to 8 cells per voxel max
-	global_counts_ssbo = create_ssbo(binding_index=5, size_in_bytes= 3 * UINT_SIZE)
-	initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo)
+	global_counts_ssbo = create_ssbo(binding_index=5, size_in_bytes=2 * UINT_SIZE)  # numActiveCells, divisionQueueCount
+	division_queue_ssbo = create_ssbo(binding_index=7, size_in_bytes=MAX_DIVISION_QUEUE * UINT_SIZE)
+	initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=NUM_CELLS)
 	# create vao for unit sphere
 	#vao, vertex_count = create_indexed_sphere_vao()
 
@@ -290,14 +301,19 @@ def main():
 		imgui.new_frame()
 
 		imgui.set_next_window_position(10, 10)
-		imgui.set_next_window_size(150, 100)
+		imgui.set_next_window_size(200, 200)
 		flags = imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_COLLAPSE
 		imgui.begin("Toggle Settings", flags=flags)
 		_, use_ssao = imgui.checkbox("Toggle SSAO", use_ssao)
 		_, only_ao = imgui.checkbox("Only AO", only_ao)
 		active_cells = read_active_cell_count(global_counts_ssbo)
-
 		imgui.text(f"Active Cells: {active_cells}")
+		imgui.separator()
+		imgui.text("Force Debugging:")
+		_, enable_spring = imgui.checkbox("Spring Force", enable_spring)
+		_, enable_bulge = imgui.checkbox("Bulge Force", enable_bulge)
+		_, enable_planar = imgui.checkbox("Planar Force", enable_planar)
+		_, enable_repulsion = imgui.checkbox("Repulsion Force", enable_repulsion)
 		imgui.end()
 
 		current_frame = glfw.get_time()
@@ -311,42 +327,86 @@ def main():
 		# Compute Shaders
 		# Dispatch all shaders each frame:
 		clear_cell_counts.use()
-		glDispatchCompute(NUM_VOXELS // 256, 1, 1)
+		glDispatchCompute((NUM_VOXELS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		count_cells_per_voxel.use()
-		glDispatchCompute(NUM_CELLS // 256, 1, 1)
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		prefix_sum_voxel_offsets.use()
-		glDispatchCompute(NUM_VOXELS // 256, 1, 1)
+		prefix_sum_voxel_offsets.set_uint("numVoxels", NUM_VOXELS)
+		glDispatchCompute(1, 1, 1)  # Only need 1 thread for sequential prefix sum
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		clear_cell_counts.use()  # Clear again for fill
-		glDispatchCompute(NUM_VOXELS // 256, 1, 1)
+		glDispatchCompute((NUM_VOXELS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		fill_voxel_cell_ids.use()
 		fill_voxel_cell_ids.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
-		glDispatchCompute(NUM_CELLS // 256, 1, 1)
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
+		# Reset division queue count
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, global_counts_ssbo)
+		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 4, UINT_SIZE, np.array([0], dtype=np.uint32).tobytes())  # Reset divisionQueueCount
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+
+		# Food + Enqueue pass
+		food_enqueue.use()
+		food_enqueue.set_int("numCells", NUM_CELLS)
+		food_enqueue.set_int("foodThreshold", 1000)
+		food_enqueue.set_int("maxDivisionQueue", MAX_DIVISION_QUEUE)
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+		# Read back division queue count
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, global_counts_ssbo)
+		queue_count_data = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 4, UINT_SIZE)  # Read divisionQueueCount at offset 4
+		division_queue_count = np.frombuffer(queue_count_data, dtype=np.uint32)[0]
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+
+		# Process division queue
+		if division_queue_count > 0:
+			process_division_queue.use()
+			process_division_queue.set_int("numCells", NUM_CELLS)
+			process_division_queue.set_float("voxelSize", VOXEL_SIZE)
+			process_division_queue.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
+			glDispatchCompute(min(int(division_queue_count), MAX_DIVISION_QUEUE) // 256 + 1, 1, 1)
+			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+		# Recompute linkCount
+		recompute_link_count.use()
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+		# Physics pass
 		simulate.use()
-		simulate.set_float("linkRestLength", 0.5)
-		simulate.set_float("springFactor", 0.01)
-		simulate.set_float("planarFactor", 0.01)
-		simulate.set_float("bulgeFactor", 0.05)
-		simulate.set_float("repulsionFactor", 0.003)
-		simulate.set_float("repulsionRadius", 3)
+		simulate.set_float("linkRestLength", 0.6)  # Increased to match initial sphere spacing better
+		simulate.set_float("springFactor", 1.0 if enable_spring else 0.0)
+		simulate.set_float("planarFactor", 1.0 if enable_planar else 0.0)
+		simulate.set_float("bulgeFactor", 1.0 if enable_bulge else 0.0)
+		simulate.set_float("repulsionFactor", 0.08 if enable_repulsion else 0.0)
+		simulate.set_float("repulsionRadius", 2)
 		simulate.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
 		simulate.set_float("timeStep", 0.005)
 		simulate.set_float("voxelSize", VOXEL_SIZE)
-		simulate.set_int("numCells", NUM_CELLS)
-		simulate.set_int("foodThreshold", 1000)
-		glDispatchCompute(NUM_CELLS // 256, 1, 1)
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
-		
-		#debug_ssbos(cell_ssbo, link_ssbo, j)
+
+		# Link healing pass
+		link_healing.use()
+		link_healing.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
+		link_healing.set_float("voxelSize", VOXEL_SIZE)
+		link_healing.set_float("linkHealingRadius", 1.2)  # Slightly larger than linkRestLength
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+		# Recompute linkCount again after link healing
+		recompute_link_count.use()
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 		j += 1
 		# Geometry pass
 		glBindFramebuffer(GL_FRAMEBUFFER, g_buffer)
@@ -451,7 +511,7 @@ def create_ssbo(binding_index, size_in_bytes):
 	return ssbo
 
 
-def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=512, sphere_radius=0.5, max_links=6):
+def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=512, sphere_radius=1, max_links=6):
 	dtype = np.dtype([
 		('position', np.float32, 3),
 		('foodLevel', np.float32),
@@ -510,7 +570,7 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 	# Build the flat link array
 	links = np.full(num_cells * max_links, -1, dtype=np.int32)
 	for i in range(num_cells):
-		neighbors = list(adjacency[i])
+		neighbors = sorted(list(adjacency[i]))  # Sort for deterministic ordering
 		cells[i]['linkCount'] = len(neighbors)
 		for k, n in enumerate(neighbors):
 			links[i * max_links + k] = n
@@ -540,7 +600,7 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 	"""
 	# -----------------------------
 	# 3. Generate global counts for cells (implicitly can calculate links)
-	global_counts = np.array([num_cells + 2], dtype=np.uint32)
+	global_counts = np.array([num_cells, 0], dtype=np.uint32)  # numActiveCells, divisionQueueCount
 	# -----------------------------
 	# 4. Upload to GPU
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, cell_ssbo)
@@ -619,7 +679,7 @@ def render_cube():
 		cube_vbo = glGenBuffers(1)
 		glBindVertexArray(cube_vao)
 		glBindBuffer(GL_ARRAY_BUFFER, cube_vbo)
-		glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_STATIC_DRAW)
+		glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices, GL_DYNAMIC_DRAW)
 		glEnableVertexAttribArray(0)
 		glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * 4, None)
 		glEnableVertexAttribArray(1)
