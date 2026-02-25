@@ -20,7 +20,8 @@ SCR_WIDTH = 1000
 SCR_HEIGHT = 750
 use_ssao = True
 only_ao = True
-NUM_CELLS = 100
+NUM_CELLS = 1024   # Max capacity for growth
+INITIAL_CELLS = 100  # Start with fewer so food accrues and division can happen
 # Force debugging toggles
 enable_spring = True
 enable_bulge = True
@@ -178,7 +179,7 @@ def main():
 	flat_voxel_cell_ids_ssbo = create_ssbo(binding_index=4, size_in_bytes=NUM_CELLS * 32 * UINT_SIZE)  # assume up to 8 cells per voxel max
 	global_counts_ssbo = create_ssbo(binding_index=5, size_in_bytes=2 * UINT_SIZE)  # numActiveCells, divisionQueueCount
 	division_queue_ssbo = create_ssbo(binding_index=7, size_in_bytes=MAX_DIVISION_QUEUE * UINT_SIZE)
-	initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=NUM_CELLS)
+	initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=INITIAL_CELLS, capacity=NUM_CELLS)
 	# create vao for unit sphere
 	#vao, vertex_count = create_indexed_sphere_vao()
 
@@ -381,7 +382,7 @@ def main():
 		# Physics pass
 		simulate.use()
 		simulate.set_float("linkRestLength", 0.6)  # Increased to match initial sphere spacing better
-		simulate.set_float("springFactor", 1.0 if enable_spring else 0.0)
+		simulate.set_float("springFactor", 2.5 if enable_spring else 0.0)
 		simulate.set_float("planarFactor", 1.0 if enable_planar else 0.0)
 		simulate.set_float("bulgeFactor", 1.0 if enable_bulge else 0.0)
 		simulate.set_float("repulsionFactor", 0.08 if enable_repulsion else 0.0)
@@ -505,7 +506,9 @@ def create_ssbo(binding_index, size_in_bytes):
 	return ssbo
 
 
-def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=512, sphere_radius=1, max_links=6):
+def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=512, capacity=None, sphere_radius=1, max_links=6):
+	if capacity is None:
+		capacity = num_cells
 	dtype = np.dtype([
 		('position', np.float32, 3),
 		('foodLevel', np.float32),
@@ -516,11 +519,12 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 		('flatVoxelIndex', np.int32),
 		('isActive', np.int32),
 	])
-	cells = np.zeros(num_cells, dtype=dtype)
+	# Allocate full capacity; only first num_cells are active sphere cells
+	cells = np.zeros(capacity, dtype=dtype)
 	golden_angle = np.pi * (3 - np.sqrt(5))
 
 	for i in range(num_cells):
-		y = 1 - (i / (num_cells - 1)) * 2
+		y = 1 - (i / max(num_cells - 1, 1)) * 2
 		radius = np.sqrt(1 - y ** 2)
 		theta = golden_angle * i
 		x = np.cos(theta) * radius
@@ -536,13 +540,17 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 		cells[i]['linkCount'] = max_links
 		cells[i]['flatVoxelIndex'] = int(shifted_flat_vox[0] + shifted_flat_vox[1] * GRID_RES + shifted_flat_vox[2] * GRID_RES * GRID_RES)
 		cells[i]['isActive'] = 1
+	for i in range(num_cells, capacity):
+		cells[i]['isActive'] = 0
+		cells[i]['linkStartIndex'] = i * max_links
+		cells[i]['linkCount'] = 0
 
-	# Build empty adjacency lists
+	# Build empty adjacency lists (only for initial sphere)
 	adjacency = [set() for _ in range(num_cells)]
 	link_counts = [0 for _ in range(num_cells)]
 
 	# Consider all unique pairs once
-	positions = cells['position']
+	positions = cells['position'][:num_cells]
 	for i in range(num_cells):
 		dists = np.linalg.norm(positions - positions[i], axis=1)
 		sorted_indices = np.argsort(dists)
@@ -561,8 +569,8 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 			if link_counts[i] >= max_links and link_counts[j] >= max_links:
 				break
 
-	# Build the flat link array
-	links = np.full(num_cells * max_links, -1, dtype=np.int32)
+	# Build the flat link array for full capacity (inactive slots have EMPTY links)
+	links = np.full(capacity * max_links, -1, dtype=np.int32)
 	for i in range(num_cells):
 		neighbors = sorted(list(adjacency[i]))  # Sort for deterministic ordering
 		cells[i]['linkCount'] = len(neighbors)
