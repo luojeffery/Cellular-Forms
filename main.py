@@ -24,7 +24,7 @@ NUM_CELLS = 100
 # Force debugging toggles
 enable_spring = True
 enable_bulge = True
-enable_planar = False
+enable_planar = True  # Planar force is essential for maintaining surface smoothness
 enable_repulsion = True
 NUM_VOXELS = 64  # 4×4×4 grid for smaller cell count
 VOXEL_SIZE = 4
@@ -382,25 +382,25 @@ def main():
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		# Physics pass
+		# The linkRestLength should match the initial neighbor spacing
+		# For 100 cells on unit sphere: sqrt(4*pi/100) * 1.5 ≈ 0.53
 		simulate.use()
-		simulate.set_float("linkRestLength", 0.6)  # Increased to match initial sphere spacing better
-		simulate.set_float("springFactor", 1.0 if enable_spring else 0.0)
-		simulate.set_float("planarFactor", 1.0 if enable_planar else 0.0)
-		simulate.set_float("bulgeFactor", 1.0 if enable_bulge else 0.0)
-		simulate.set_float("repulsionFactor", 0.08 if enable_repulsion else 0.0)
-		simulate.set_float("repulsionRadius", 2)
+		simulate.set_float("linkRestLength", 0.5)  # Target distance between linked cells
+		simulate.set_float("springFactor", 0.5 if enable_spring else 0.0)  # Keep links at rest length
+		simulate.set_float("planarFactor", 0.2 if enable_planar else 0.0)  # Smooth the surface
+		simulate.set_float("bulgeFactor", 0.3 if enable_bulge else 0.0)   # Expand outward
+		simulate.set_float("repulsionFactor", 0.01 if enable_repulsion else 0.0)  # Gentle repulsion
+		simulate.set_float("repulsionRadius", 0.4)  # Only repel very close non-linked cells
 		simulate.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
-		simulate.set_float("timeStep", 0.005)
+		simulate.set_float("timeStep", 0.1)
 		simulate.set_float("voxelSize", VOXEL_SIZE)
-		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
-		# Link healing pass
+		# Link maintenance pass (break overstretched links, clean up invalid links)
 		link_healing.use()
-		link_healing.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
-		link_healing.set_float("voxelSize", VOXEL_SIZE)
-		link_healing.set_float("linkHealingRadius", 1.2)  # Slightly larger than linkRestLength
-		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+		link_healing.set_float("linkBreakDistance", 1.5)  # Break links stretched to 3x rest length
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		# Recompute linkCount again after link healing
@@ -512,6 +512,13 @@ def create_ssbo(binding_index, size_in_bytes):
 
 
 def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=512, sphere_radius=1, max_links=6):
+	"""
+	Initialize cells on a sphere surface with proper link topology.
+	
+	The key insight from the Lomas paper is that cells form a 2D surface topology
+	(like a mesh). Each cell should be linked to its nearest neighbors on the surface,
+	forming a roughly triangular mesh pattern.
+	"""
 	dtype = np.dtype([
 		('position', np.float32, 3),
 		('foodLevel', np.float32),
@@ -525,6 +532,7 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 	cells = np.zeros(num_cells, dtype=dtype)
 	golden_angle = np.pi * (3 - np.sqrt(5))
 
+	# Distribute cells on sphere using golden spiral
 	for i in range(num_cells):
 		y = 1 - (i / (num_cells - 1)) * 2
 		radius = np.sqrt(1 - y ** 2)
@@ -537,17 +545,27 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 		shifted_flat_vox = vox_coord + flat_voxel_offset
 		cells[i]['position'] = pos
 		cells[i]['voxelCoord'] = vox_coord
-		cells[i]['radius'] = 0.1
+		cells[i]['radius'] = 0.05  # Visual radius for rendering
 		cells[i]['linkStartIndex'] = i * max_links
 		cells[i]['linkCount'] = max_links
 		cells[i]['flatVoxelIndex'] = int(shifted_flat_vox[0] + shifted_flat_vox[1] * GRID_RES + shifted_flat_vox[2] * GRID_RES * GRID_RES)
 		cells[i]['isActive'] = 1
 
-	# Build empty adjacency lists
+	# Calculate expected neighbor distance for this cell count on a sphere
+	# Surface area of unit sphere = 4*pi, area per cell = 4*pi/n
+	# If cells form roughly equilateral triangles, side length ~ sqrt(4*pi/n * 4/sqrt(3))
+	expected_neighbor_dist = np.sqrt(4 * np.pi / num_cells) * sphere_radius * 1.5
+	print(f"Expected neighbor distance: {expected_neighbor_dist:.4f}")
+	
+	# Build adjacency based on distance threshold
+	# Only link cells that are close enough to be true surface neighbors
 	adjacency = [set() for _ in range(num_cells)]
 	link_counts = [0 for _ in range(num_cells)]
+	
+	# Maximum distance for creating a link (slightly larger than expected to ensure connectivity)
+	max_link_dist = expected_neighbor_dist * 1.5
+	print(f"Max link distance: {max_link_dist:.4f}")
 
-	# Consider all unique pairs once
 	positions = cells['position']
 	for i in range(num_cells):
 		dists = np.linalg.norm(positions - positions[i], axis=1)
@@ -555,6 +573,10 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 		for j in sorted_indices:
 			if i == j:
 				continue
+			dist = dists[j]
+			# Stop if we're beyond the max link distance
+			if dist > max_link_dist:
+				break
 			if link_counts[i] >= max_links or link_counts[j] >= max_links:
 				continue
 			if j in adjacency[i] or i in adjacency[j]:
@@ -564,16 +586,19 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 			adjacency[j].add(i)
 			link_counts[i] += 1
 			link_counts[j] += 1
-			if link_counts[i] >= max_links and link_counts[j] >= max_links:
-				break
 
 	# Build the flat link array
 	links = np.full(num_cells * max_links, -1, dtype=np.int32)
+	total_links = 0
 	for i in range(num_cells):
-		neighbors = sorted(list(adjacency[i]))  # Sort for deterministic ordering
+		neighbors = sorted(list(adjacency[i]))
 		cells[i]['linkCount'] = len(neighbors)
+		total_links += len(neighbors)
 		for k, n in enumerate(neighbors):
 			links[i * max_links + k] = n
+	
+	print(f"Total links created: {total_links // 2} (bidirectional)")
+	print(f"Average links per cell: {total_links / num_cells:.2f}")
 
 	"""
 	debug for link healing
