@@ -147,20 +147,20 @@ def main():
 	glEnable(GL_DEPTH_TEST)
 
 	# Load shaders
-	clear_cell_counts = Compute_Shader("clear_cell_counts.glsl")
-	count_cells_per_voxel = Compute_Shader("count_cells_per_voxel.glsl")
-	prefix_sum_voxel_offsets = Compute_Shader("prefix_sum_voxel_offsets.glsl")
-	fill_voxel_cell_ids = Compute_Shader("fill_voxel_cell_ids.glsl")
-	food_enqueue = Compute_Shader("food_enqueue.glsl")
-	process_division_queue = Compute_Shader("process_division_queue.glsl")
-	recompute_link_count = Compute_Shader("recompute_link_count.glsl")
-	link_healing = Compute_Shader("link_healing.glsl")
-	simulate = Compute_Shader("simulate.glsl")
+	clear_cell_counts = Compute_Shader("shaders/compute/clear_cell_counts.glsl")
+	count_cells_per_voxel = Compute_Shader("shaders/compute/count_cells_per_voxel.glsl")
+	prefix_sum_voxel_offsets = Compute_Shader("shaders/compute/prefix_sum_voxel_offsets.glsl")
+	fill_voxel_cell_ids = Compute_Shader("shaders/compute/fill_voxel_cell_ids.glsl")
+	food_enqueue = Compute_Shader("shaders/compute/food_enqueue.glsl")
+	process_division_queue = Compute_Shader("shaders/compute/process_division_queue.glsl")
+	recompute_link_count = Compute_Shader("shaders/compute/recompute_link_count.glsl")
+	link_healing = Compute_Shader("shaders/compute/link_healing.glsl")
+	simulate = Compute_Shader("shaders/compute/simulate.glsl")
 
-	shader_geometry_pass = Shader("vs.ssao_geometry.glsl", "fs.ssao_geometry.glsl")
-	shader_lighting_pass = Shader("vs.ssao.glsl", "fs.ssao_lighting.glsl")
-	shader_ssao = Shader("vs.ssao.glsl", "fs.ssao.glsl")
-	shader_ssao_blur = Shader("vs.ssao.glsl", "fs.ssao_blur.glsl")
+	shader_geometry_pass = Shader("shaders/vertex/vs.ssao_geometry.glsl", "shaders/fragment/fs.ssao_geometry.glsl")
+	shader_lighting_pass = Shader("shaders/vertex/vs.ssao.glsl", "shaders/fragment/fs.ssao_lighting.glsl")
+	shader_ssao = Shader("shaders/vertex/vs.ssao.glsl", "shaders/fragment/fs.ssao.glsl")
+	shader_ssao_blur = Shader("shaders/vertex/vs.ssao.glsl", "shaders/fragment/fs.ssao_blur.glsl")
 
 	# Load models
 	backpack = Model("objects/backpack/backpack.obj")

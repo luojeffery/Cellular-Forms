@@ -100,40 +100,40 @@ A **voxel grid** is used to accelerate neighbor queries for repulsion calculatio
 - Grid is centered at origin (cells have shifted coordinates)
 
 **Voxel Grid Pipeline** (each frame):
-1. `clear_cell_counts.glsl`: Clear cell counts per voxel
-2. `count_cells_per_voxel.glsl`: Count cells in each voxel
-3. `prefix_sum_voxel_offsets.glsl`: Compute prefix sum for indexing
-4. `fill_voxel_cell_ids.glsl`: Fill flat array with cell IDs organized by voxel
+1. `shaders/compute/clear_cell_counts.glsl`: Clear cell counts per voxel
+2. `shaders/compute/count_cells_per_voxel.glsl`: Count cells in each voxel
+3. `shaders/compute/prefix_sum_voxel_offsets.glsl`: Compute prefix sum for indexing
+4. `shaders/compute/fill_voxel_cell_ids.glsl`: Fill flat array with cell IDs organized by voxel
 
 ## Compute Shader Pipeline
 
 The simulation runs entirely on GPU using compute shaders. Each frame executes:
 
 ### 1. Spatial Grid Update
-- **clear_cell_counts.glsl**: Reset voxel cell counts
-- **count_cells_per_voxel.glsl**: Count cells per voxel
-- **prefix_sum_voxel_offsets.glsl**: Compute start indices for each voxel
-- **fill_voxel_cell_ids.glsl**: Populate flat voxel→cell mapping
+- **shaders/compute/clear_cell_counts.glsl**: Reset voxel cell counts
+- **shaders/compute/count_cells_per_voxel.glsl**: Count cells per voxel
+- **shaders/compute/prefix_sum_voxel_offsets.glsl**: Compute start indices for each voxel
+- **shaders/compute/fill_voxel_cell_ids.glsl**: Populate flat voxel→cell mapping
 
 ### 2. Food & Division Queue
-- **food_enqueue.glsl**: 
+- **shaders/compute/food_enqueue.glsl**: 
   - Adds random food increment to each active cell
   - Enqueues cells with `foodLevel >= foodThreshold` for division
   - Uses atomic operations for thread-safe queue insertion
 
 ### 3. Cell Division
-- **process_division_queue.glsl**:
+- **shaders/compute/process_division_queue.glsl**:
   - Processes queued divisions
   - Creates daughter cells
   - Updates link topology (severs/reassigns links)
   - Updates neighbor references
 
 ### 4. Link Management
-- **recompute_link_count.glsl**: Recomputes `linkCount` after topology changes
-- **link_healing.glsl**: Creates new links between nearby unlinked cells in same voxel
+- **shaders/compute/recompute_link_count.glsl**: Recomputes `linkCount` after topology changes
+- **shaders/compute/link_healing.glsl**: Creates new links between nearby unlinked cells in same voxel
 
 ### 5. Physics Simulation
-- **simulate.glsl**: 
+- **shaders/compute/simulate.glsl**: 
   - Computes spring, planar, and bulge forces
   - Calculates repulsion from non-linked neighbors (using voxel grid)
   - Updates cell positions
@@ -143,20 +143,20 @@ The simulation runs entirely on GPU using compute shaders. Each frame executes:
 
 ### Deferred Rendering with SSAO
 
-1. **Geometry Pass** (`vs.ssao_geometry.glsl` / `fs.ssao_geometry.glsl`):
+1. **Geometry Pass** (`shaders/vertex/vs.ssao_geometry.glsl` / `shaders/fragment/fs.ssao_geometry.glsl`):
    - Renders to G-Buffer: position, normal, albedo
    - Instanced rendering of cells (spheres) from SSBO data
    - Also renders scene objects (backpack, cube room)
 
-2. **SSAO Pass** (`vs.ssao.glsl` / `fs.ssao.glsl`):
+2. **SSAO Pass** (`shaders/vertex/vs.ssao.glsl` / `shaders/fragment/fs.ssao.glsl`):
    - Samples 64 random points in hemisphere around each pixel
    - Uses position and normal from G-Buffer
    - Calculates ambient occlusion based on depth differences
 
-3. **Blur Pass** (`fs.ssao_blur.glsl`):
+3. **Blur Pass** (`shaders/fragment/fs.ssao_blur.glsl`):
    - Blurs SSAO texture to reduce noise
 
-4. **Lighting Pass** (`vs.ssao.glsl` / `fs.ssao_lighting.glsl`):
+4. **Lighting Pass** (`shaders/vertex/vs.ssao.glsl` / `shaders/fragment/fs.ssao_lighting.glsl`):
    - Combines G-Buffer data with SSAO
    - Applies point light with attenuation
    - Outputs final lit scene
@@ -202,21 +202,25 @@ Key simulation parameters (in `main.py`):
 ```
 ssao/
 ├── main.py                    # Main application loop, initialization, rendering
-├── simulate.glsl              # Physics simulation compute shader
-├── food_enqueue.glsl          # Food accumulation and division queue
-├── process_division_queue.glsl # Cell division logic
-├── link_healing.glsl          # Creates links between nearby cells
-├── recompute_link_count.glsl  # Updates link counts after topology changes
-├── count_cells_per_voxel.glsl # Spatial grid: count cells per voxel
-├── prefix_sum_voxel_offsets.glsl # Spatial grid: prefix sum
-├── fill_voxel_cell_ids.glsl  # Spatial grid: fill cell ID array
-├── clear_cell_counts.glsl     # Spatial grid: clear counts
-├── vs.ssao_geometry.glsl      # Geometry pass vertex shader
-├── fs.ssao_geometry.glsl      # Geometry pass fragment shader
-├── vs.ssao.glsl               # SSAO/lighting pass vertex shader
-├── fs.ssao.glsl               # SSAO fragment shader
-├── fs.ssao_blur.glsl          # SSAO blur fragment shader
-├── fs.ssao_lighting.glsl      # Final lighting fragment shader
+├── shaders/
+│   ├── compute/
+│   │   ├── simulate.glsl              # Physics simulation compute shader
+│   │   ├── food_enqueue.glsl          # Food accumulation and division queue
+│   │   ├── process_division_queue.glsl # Cell division logic
+│   │   ├── link_healing.glsl          # Creates links between nearby cells
+│   │   ├── recompute_link_count.glsl  # Updates link counts after topology changes
+│   │   ├── count_cells_per_voxel.glsl # Spatial grid: count cells per voxel
+│   │   ├── prefix_sum_voxel_offsets.glsl # Spatial grid: prefix sum
+│   │   ├── fill_voxel_cell_ids.glsl  # Spatial grid: fill cell ID array
+│   │   └── clear_cell_counts.glsl     # Spatial grid: clear counts
+│   ├── vertex/
+│   │   ├── vs.ssao_geometry.glsl      # Geometry pass vertex shader
+│   │   └── vs.ssao.glsl               # SSAO/lighting pass vertex shader
+│   └── fragment/
+│       ├── fs.ssao_geometry.glsl      # Geometry pass fragment shader
+│       ├── fs.ssao.glsl               # SSAO fragment shader
+│       ├── fs.ssao_blur.glsl          # SSAO blur fragment shader
+│       └── fs.ssao_lighting.glsl      # Final lighting fragment shader
 ├── compute_shader.py          # Compute shader wrapper class
 ├── shader.py                  # Shader compilation utilities
 ├── camera.py                  # Camera controller
