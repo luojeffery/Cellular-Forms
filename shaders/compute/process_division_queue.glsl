@@ -27,6 +27,7 @@ layout(std430, binding = 7) buffer DivisionQueue {
 };
 
 uniform int numCells;
+uniform float linkRestLength;
 
 const uint EMPTY = 0xFFFFFFFFu;
 
@@ -53,12 +54,14 @@ vec3 safeNormalize(vec3 v, vec3 fallback) {
     return fallback;
 }
 
+// The link rest length must match the value passed to the simulate shader (linkRestLength uniform).
+
 void main() {
     uint queueIndex = gl_GlobalInvocationID.x;
-    
+
     // Check if this thread should process a division
     if (queueIndex >= divisionQueueCount) return;
-    
+
     uint parentId = divisionQueue[queueIndex];
     if (parentId >= cells.length() || cells[parentId].isActive == 0) return;
 
@@ -70,91 +73,112 @@ void main() {
         return;
     }
 
-    // Initialize daughter cell
-    cells[newIndex].isActive = 1;
+    int parentBase = cells[parentId].linkStartIndex;
+    vec3 parentPos = cells[parentId].position;
+    vec3 radialFallback = safeNormalize(parentPos, vec3(0.0, 1.0, 0.0));
+
+    // Gather active neighbors and their relative positions for normal estimation.
+    vec3 rel[6];
+    int relCount = 0;
+    vec3 neighborPosSum = vec3(0.0);
+    for (int i = 0; i < 6; i++) {
+        uint neighbor = links[parentBase + i];
+        if (neighbor == EMPTY || neighbor >= cells.length() || cells[neighbor].isActive == 0) continue;
+        rel[relCount] = cells[neighbor].position - parentPos;
+        neighborPosSum += cells[neighbor].position;
+        relCount++;
+    }
+
+    // Estimate the outward surface normal using cross products of neighbor-pair vectors.
+    // This is more robust than the simple sum-of-directions approach.
+    vec3 outward;
+    if (relCount >= 2) {
+        vec3 normalSum = vec3(0.0);
+        for (int i = 0; i < relCount; ++i) {
+            for (int j = i + 1; j < relCount; ++j) {
+                vec3 cp = cross(rel[i], rel[j]);
+                float cpLen2 = dot(cp, cp);
+                if (cpLen2 > 1e-10) {
+                    normalSum += cp * inversesqrt(cpLen2);
+                }
+            }
+        }
+        if (dot(normalSum, normalSum) > 1e-8) {
+            // Orient consistent with the radial direction (outward from origin).
+            if (dot(normalSum, radialFallback) < 0.0) normalSum = -normalSum;
+            outward = safeNormalize(normalSum, radialFallback);
+        } else {
+            outward = safeNormalize(parentPos - neighborPosSum / float(relCount), radialFallback);
+        }
+    } else if (relCount > 0) {
+        outward = safeNormalize(parentPos - neighborPosSum / float(relCount), radialFallback);
+    } else {
+        outward = radialFallback;
+    }
+
+    // Choose a random TANGENTIAL split direction (perpendicular to the surface normal).
+    // Splitting tangentially keeps both daughter and parent on the surface shell.
     float rx = randFloat(parentId * 7u + 0u) * 2.0 - 1.0;
     float ry = randFloat(parentId * 7u + 1u) * 2.0 - 1.0;
     float rz = randFloat(parentId * 7u + 2u) * 2.0 - 1.0;
-    float tx = randFloat(parentId * 7u + 3u) * 2.0 - 1.0;
-    float ty = randFloat(parentId * 7u + 4u) * 2.0 - 1.0;
-    float tz = randFloat(parentId * 7u + 5u) * 2.0 - 1.0;
-
-    int parentBase = cells[parentId].linkStartIndex;
-    vec3 parentPos = cells[parentId].position;
-
-    // Estimate outward surface normal from local neighborhood to keep growth on the shell.
-    vec3 normalSum = vec3(0.0);
-    for (int i = 0; i < 6; i++) {
-        uint neighbor = links[parentBase + i];
-        if (neighbor == EMPTY || neighbor >= cells.length() || cells[neighbor].isActive == 0) {
-            continue;
-        }
-        normalSum += safeNormalize(parentPos - cells[neighbor].position, vec3(0.0, 1.0, 0.0));
-    }
-
-    vec3 radialFallback = safeNormalize(parentPos, vec3(0.0, 1.0, 0.0));
-    vec3 outward = safeNormalize(normalSum, radialFallback);
     vec3 randomVec = safeNormalize(vec3(rx, ry, rz), radialFallback);
+    // Project onto the tangent plane of the surface and renormalize.
+    vec3 splitDir = randomVec - dot(randomVec, outward) * outward;
+    splitDir = safeNormalize(splitDir, cross(outward, radialFallback));
 
-    // Tangential jitter helps break symmetry without sending daughter deep into the volume.
-    vec3 tangent = randomVec - dot(randomVec, outward) * outward;
-    tangent = safeNormalize(tangent, vec3(1.0, 0.0, 0.0));
-    float tangentSign = (randFloat(parentId * 7u + 6u) < 0.5) ? -1.0 : 1.0;
-
-    vec3 splitOffset = 0.08 * outward + 0.03 * tangentSign * tangent;
-    cells[newIndex].position = parentPos + splitOffset;
+    // Place the daughter half a rest-length away in the tangential split direction.
+    // This gives the physics a clear, surface-aligned starting state.
+    cells[newIndex].position = parentPos + (linkRestLength * 0.5) * splitDir;
+    cells[newIndex].isActive = 1;
     cells[newIndex].radius = 0.3;
     cells[newIndex].voxelCoord = cells[parentId].voxelCoord;
     cells[newIndex].flatVoxelIndex = cells[parentId].flatVoxelIndex;
     cells[newIndex].linkStartIndex = int(newIndex * 6);
     cells[newIndex].linkCount = 0; // Will be recomputed later
     cells[newIndex].foodLevel = 0.0;
-    
+
     // Initialize daughter's link slots to EMPTY
+    int daughterBase = cells[newIndex].linkStartIndex;
     for (int i = 0; i < 6; ++i) {
-        links[cells[newIndex].linkStartIndex + i] = EMPTY;
+        links[daughterBase + i] = EMPTY;
     }
 
-    // Step 1: Sever half of parent's links and assign to daughter
-    int daughterBase = cells[newIndex].linkStartIndex;
-    int linksToSever = cells[parentId].linkCount / 2;
-    uint neighbors[6]; // Max 6 neighbors
-    int neighborCount = 0;
+    // Divide parent's links spatially: neighbors on the positive splitDir side transfer to
+    // the daughter cell, preserving a locally planar (manifold) surface topology.
+    uint transferredNeighbors[6];
+    int transferredCount = 0;
+    int daughterLinkCount = 0;
 
     for (int i = 0; i < 6; i++) {
         uint neighbor = links[parentBase + i];
-        if (neighbor == EMPTY || neighborCount >= linksToSever) {
-            // Leave daughter slot empty or already severed enough
-            continue;
+        if (neighbor == EMPTY || neighbor >= cells.length() || cells[neighbor].isActive == 0) continue;
+
+        // Determine which side of the split plane this neighbor falls on.
+        vec3 toNeighbor = cells[neighbor].position - parentPos;
+        float side = dot(toNeighbor, splitDir);
+
+        // Positive-side neighbors go to daughter (reserve one slot for the parent-daughter link).
+        if (side > 0.0 && daughterLinkCount < 5) {
+            links[parentBase + i] = EMPTY;
+            links[daughterBase + daughterLinkCount] = neighbor;
+            daughterLinkCount++;
+            transferredNeighbors[transferredCount++] = neighbor;
         }
-        
-        // Sever from parent and assign to daughter
-        links[parentBase + i] = EMPTY;
-        links[daughterBase + neighborCount] = neighbor;
-        neighbors[neighborCount++] = neighbor;
+        // Negative-side (and zero) neighbors stay with the parent.
     }
 
-    // Step 2: Add parent-daughter link (daughter -> parent)
+    // Add bidirectional parent-daughter link.
     for (int i = 0; i < 6; i++) {
-        if (links[daughterBase + i] == EMPTY) {
-            links[daughterBase + i] = parentId;
-            break;
-        }
+        if (links[daughterBase + i] == EMPTY) { links[daughterBase + i] = parentId; break; }
     }
-
-    // Step 3: Add parent-daughter link (parent -> daughter)
     for (int i = 0; i < 6; i++) {
-        if (links[parentBase + i] == EMPTY) {
-            links[parentBase + i] = newIndex;
-            break;
-        }
+        if (links[parentBase + i] == EMPTY) { links[parentBase + i] = newIndex; break; }
     }
 
-    // Step 4: Update neighbors: replace parent link with daughter link
-    for (int i = 0; i < neighborCount; i++) {
-        uint neighbor = neighbors[i];
+    // Update transferred neighbors: replace their link to parent with a link to daughter.
+    for (int i = 0; i < transferredCount; i++) {
+        uint neighbor = transferredNeighbors[i];
         int neighborBase = cells[neighbor].linkStartIndex;
-
         for (int j = 0; j < 6; j++) {
             if (links[neighborBase + j] == parentId) {
                 links[neighborBase + j] = newIndex;
@@ -163,5 +187,5 @@ void main() {
         }
     }
 
-    // Note: linkCount is NOT updated here - it will be recomputed in a separate pass
+    // Note: linkCount is NOT updated here - it will be recomputed in a separate pass.
 }

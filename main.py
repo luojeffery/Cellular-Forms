@@ -423,6 +423,7 @@ def main():
 				division_happened = True
 				process_division_queue.use()
 				process_division_queue.set_int("numCells", NUM_CELLS)
+				process_division_queue.set_float("linkRestLength", 0.6)
 				glDispatchCompute(min(int(division_queue_count), MAX_DIVISION_QUEUE) // 256 + 1, 1, 1)
 				glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
@@ -455,7 +456,7 @@ def main():
 			# Link healing pass
 			link_healing.use()
 			link_healing.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
-			link_healing.set_float("healingRadius", 1.25)
+			link_healing.set_float("healingRadius", 0.9)
 			link_healing.set_int("targetNeighbors", 6)
 			glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
