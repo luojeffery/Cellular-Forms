@@ -34,8 +34,11 @@ layout(std430, binding = 5) buffer GlobalCounts {
 
 const uint EMPTY = 0xFFFFFFFFu;
 const int MAX_NEIGHBORS = 6;
-const float MIN_NORMAL_ALIGNMENT = 0.35;
-const float MAX_RADIAL_SEPARATION = 0.45;
+// Normals must agree within ~49.5° (cos⁻¹ 0.65) to be considered the same surface patch.
+const float MIN_NORMAL_ALIGNMENT = 0.65;
+// Keep radial (normal-direction) separation tight so cells on opposite faces of a thin
+// shell cannot heal a link across the shell interior.
+const float MAX_RADIAL_SEPARATION = 0.25;
 
 uniform vec3 gridResolution;
 uniform float healingRadius;
