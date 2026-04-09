@@ -24,45 +24,29 @@ layout(std430, binding = 7) buffer DivisionQueue {
 };
 
 uniform int numCells;
-uniform int foodThreshold;
+uniform float foodPerFrame;
+uniform float foodThreshold;
 uniform int maxDivisionQueue;
-
-uint hash(uint x) {
-    x ^= x >> 17;
-    x *= 0xed5ad4bbU;
-    x ^= x >> 11;
-    x *= 0xac4c1b51U;
-    x ^= x >> 15;
-    x *= 0x31848babU;
-    x ^= x >> 14;
-    return x;
-}
-
-float randFloat(uint seed) {
-    return float(hash(seed) & 0xFFFFu) / float(0xFFFFu); // in [0.0, 1.0)
-}
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
 
     if (id >= cells.length() || cells[id].isActive == 0) return;
 
-    // Add food increment
-    float r = randFloat(id + uint(gl_WorkGroupID.x) * 1234u);
-    float increment = 1.0 + 9.0 * r;
-
-    if (numActiveCells < numCells) {
-        cells[id].foodLevel += increment;
+    if (numActiveCells >= numCells) {
+        return;
     }
 
-    // Enqueue if ready to divide
-    if (cells[id].foodLevel >= foodThreshold && numActiveCells < numCells) {
+    // Uniform feeding: every active cell gets the same amount each frame.
+    cells[id].foodLevel += foodPerFrame;
+
+    // Enqueue if ready to divide.
+    if (cells[id].foodLevel >= foodThreshold) {
         uint queueIndex = atomicAdd(divisionQueueCount, 1u);
         if (queueIndex < maxDivisionQueue) {
             divisionQueue[queueIndex] = id;
-            cells[id].foodLevel = 0.0; // Reset food so we don't enqueue again next frame
+            cells[id].foodLevel = 0.0; // Reset so each parent divides at most once per growth step.
         } else {
-            // Queue full, undo the increment
             atomicAdd(divisionQueueCount, -1u);
         }
     }

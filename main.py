@@ -16,25 +16,32 @@ from camera import Camera, Camera_Movement
 from compute_shader import Compute_Shader
 
 # Settings
-SCR_WIDTH = 1000
-SCR_HEIGHT = 750
+SCR_WIDTH = 1920
+SCR_HEIGHT = 1080
 use_ssao = True
-only_ao = True
-NUM_CELLS = 1024   # Max capacity for growth
-INITIAL_CELLS = 100  # Start with fewer so food accrues and division can happen
+use_phong = True
+NUM_CELLS = 25_000   # Max capacity for growth
+INITIAL_CELLS = 2_000
+ENABLE_FEEDING = True
 # Force debugging toggles
 enable_spring = True
 enable_bulge = True
-enable_planar = False
+enable_planar = True
 enable_repulsion = True
-NUM_VOXELS = 64  # 4×4×4 grid for smaller cell count
+spring_strength = 50.0
+bulge_strength = 2.0
+planar_strength = 2.0
+repulsion_strength = 0.008
+NUM_VOXELS = 216  # 6x6x6; keep <= 256 because prefix-sum shader is single-workgroup
 VOXEL_SIZE = 4
 GRID_RES = int(round(NUM_VOXELS ** (1 / 3)))  # Will be 4
 MAX_LINKS = NUM_CELLS * 6  # Estimate
-MAX_DIVISION_QUEUE = 8192  # Maximum divisions per frame
+MAX_DIVISION_QUEUE = 262144  # Maximum divisions per frame
+HEALING_ITERATIONS_AFTER_DIVISION = 6
+RECENTER_SAMPLE_CELLS = 65536  # Sampled centroid readback cap to keep CPU-GPU sync manageable
 
 # Camera
-camera = Camera(glm.vec3(0.0, 0.0, 5.0))
+camera = Camera(glm.vec3(0.0, 0.0, 5.0), pitch=45.0)
 last_x = SCR_WIDTH / 2
 last_y = SCR_HEIGHT / 2
 first_mouse = True
@@ -56,6 +63,7 @@ def impl_glfw_init():
 	glfw.window_hint(glfw.CONTEXT_VERSION_MAJOR, 4)
 	glfw.window_hint(glfw.CONTEXT_VERSION_MINOR, 6)
 	glfw.window_hint(glfw.OPENGL_PROFILE, glfw.OPENGL_CORE_PROFILE)
+	glfw.window_hint(glfw.MAXIMIZED, glfw.TRUE)
 
 	glfw.window_hint(glfw.OPENGL_FORWARD_COMPAT, GL_TRUE)
 
@@ -79,6 +87,28 @@ def read_active_cell_count(global_counts_ssbo):
 	data = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 4)
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
 	return np.frombuffer(data, dtype=np.uint32)[0]
+
+
+def read_active_cell_stats(cell_ssbo, sample_cells):
+	cell_dtype = np.dtype([
+		('position', np.float32, 3),
+		('foodLevel', np.float32),
+		('voxelCoord', np.float32, 3),
+		('radius', np.float32),
+		('linkStartIndex', np.int32),
+		('linkCount', np.int32),
+		('flatVoxelIndex', np.int32),
+		('isActive', np.int32),
+	])
+	cell_data = read_ssbo(cell_ssbo, cell_dtype, sample_cells)
+	active_mask = cell_data['isActive'] == 1
+	if not np.any(active_mask):
+		return np.zeros(3, dtype=np.float32), 1.0
+	positions = cell_data['position'][active_mask]
+	centroid = np.mean(positions, axis=0).astype(np.float32)
+	distances = np.linalg.norm(positions - centroid, axis=1)
+	max_distance = float(np.max(distances)) if distances.size > 0 else 1.0
+	return centroid, max(max_distance, 1e-4)
 
 
 def debug_ssbos(cell_ssbo, link_ssbo, j):
@@ -132,10 +162,15 @@ def read_ssbo(buffer_id, dtype, count):
 
 
 def main():
-	global delta_time, last_frame, use_ssao, only_ao, enable_spring, enable_bulge, enable_planar, enable_repulsion
+	global delta_time, last_frame, use_ssao, use_phong, enable_spring, enable_bulge, enable_planar, enable_repulsion
+	global spring_strength, bulge_strength, planar_strength, repulsion_strength
+	global SCR_WIDTH, SCR_HEIGHT, last_x, last_y
 
 	imgui.create_context()
 	window = impl_glfw_init()
+	SCR_WIDTH, SCR_HEIGHT = glfw.get_framebuffer_size(window)
+	last_x = SCR_WIDTH / 2
+	last_y = SCR_HEIGHT / 2
 	impl = GlfwRenderer(window)
 
 	glfw.set_framebuffer_size_callback(window, framebuffer_size_callback)
@@ -153,8 +188,10 @@ def main():
 	fill_voxel_cell_ids = Compute_Shader("shaders/compute/fill_voxel_cell_ids.glsl")
 	food_enqueue = Compute_Shader("shaders/compute/food_enqueue.glsl")
 	process_division_queue = Compute_Shader("shaders/compute/process_division_queue.glsl")
+	sanitize_links = Compute_Shader("shaders/compute/sanitize_links.glsl")
 	recompute_link_count = Compute_Shader("shaders/compute/recompute_link_count.glsl")
 	link_healing = Compute_Shader("shaders/compute/link_healing.glsl")
+	recenter_cells = Compute_Shader("shaders/compute/recenter_cells.glsl")
 	simulate = Compute_Shader("shaders/compute/simulate.glsl")
 
 	shader_geometry_pass = Shader("shaders/vertex/vs.ssao_geometry.glsl", "shaders/fragment/fs.ssao_geometry.glsl")
@@ -163,10 +200,10 @@ def main():
 	shader_ssao_blur = Shader("shaders/vertex/vs.ssao.glsl", "shaders/fragment/fs.ssao_blur.glsl")
 
 	# Load models
-	backpack = Model("objects/backpack/backpack.obj")
 	sphere = Model("objects/sphere/sphere.obj")
 	# Create SSBOs
-	CELL_STRUCT_SIZE = 64
+	# std430 Cell stride is 48 bytes: (vec3+float) + (vec3+float) + 4 ints
+	CELL_STRUCT_SIZE = 48
 	LINK_ENTRY_SIZE = 4  # int
 	UINT_SIZE = 4
 
@@ -176,10 +213,17 @@ def main():
 	cell_count_per_voxel_ssbo = create_ssbo(binding_index=2, size_in_bytes=NUM_VOXELS * UINT_SIZE)
 	start_index_per_voxel_ssbo = create_ssbo(binding_index=3, size_in_bytes=NUM_VOXELS * UINT_SIZE)
 	# todo: might have to change this size
-	flat_voxel_cell_ids_ssbo = create_ssbo(binding_index=4, size_in_bytes=NUM_CELLS * 32 * UINT_SIZE)  # assume up to 8 cells per voxel max
+	flat_voxel_cell_ids_ssbo = create_ssbo(binding_index=4, size_in_bytes=NUM_CELLS * UINT_SIZE)
 	global_counts_ssbo = create_ssbo(binding_index=5, size_in_bytes=2 * UINT_SIZE)  # numActiveCells, divisionQueueCount
 	division_queue_ssbo = create_ssbo(binding_index=7, size_in_bytes=MAX_DIVISION_QUEUE * UINT_SIZE)
-	initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=INITIAL_CELLS, capacity=NUM_CELLS)
+	initialize_cells_hex_sheet_with_links(
+		cell_ssbo,
+		link_ssbo,
+		global_counts_ssbo,
+		num_cells=INITIAL_CELLS,
+		capacity=NUM_CELLS,
+		link_rest_length=0.6,
+	)
 	# create vao for unit sphere
 	#vao, vertex_count = create_indexed_sphere_vao()
 
@@ -278,7 +322,7 @@ def main():
 
 	# Lighting info
 	light_pos = glm.vec3(2.0, 4.0, -2.0)
-	light_color = glm.vec3(0.2, 0.2, 0.7)
+	light_color = glm.vec3(0.68, 0.68, 0.68)
 
 	# Shader config
 	shader_lighting_pass.use()
@@ -302,19 +346,23 @@ def main():
 		imgui.new_frame()
 
 		imgui.set_next_window_position(10, 10)
-		imgui.set_next_window_size(200, 200)
+		imgui.set_next_window_size(260, 320)
 		flags = imgui.WINDOW_NO_RESIZE | imgui.WINDOW_NO_COLLAPSE
 		imgui.begin("Toggle Settings", flags=flags)
 		_, use_ssao = imgui.checkbox("Toggle SSAO", use_ssao)
-		_, only_ao = imgui.checkbox("Only AO", only_ao)
+		_, use_phong = imgui.checkbox("Phong Shading", use_phong)
 		active_cells = read_active_cell_count(global_counts_ssbo)
 		imgui.text(f"Active Cells: {active_cells}")
 		imgui.separator()
 		imgui.text("Force Debugging:")
 		_, enable_spring = imgui.checkbox("Spring Force", enable_spring)
+		_, spring_strength = imgui.slider_float("Spring Strength", spring_strength, 0.0, 100.0)
 		_, enable_bulge = imgui.checkbox("Bulge Force", enable_bulge)
+		_, bulge_strength = imgui.slider_float("Bulge Strength", bulge_strength, 0.0, 100.0)
 		_, enable_planar = imgui.checkbox("Planar Force", enable_planar)
+		_, planar_strength = imgui.slider_float("Planar Strength", planar_strength, 0.0, 100.0)
 		_, enable_repulsion = imgui.checkbox("Repulsion Force", enable_repulsion)
+		_, repulsion_strength = imgui.slider_float("Repulsion Strength", repulsion_strength, 0.0, 7.0)
 		imgui.end()
 
 		current_frame = glfw.get_time()
@@ -352,27 +400,36 @@ def main():
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, global_counts_ssbo)
 		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 4, UINT_SIZE, np.array([0], dtype=np.uint32).tobytes())  # Reset divisionQueueCount
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+		division_happened = False
 
-		# Food + Enqueue pass
-		food_enqueue.use()
-		food_enqueue.set_int("numCells", NUM_CELLS)
-		food_enqueue.set_int("foodThreshold", 1000)
-		food_enqueue.set_int("maxDivisionQueue", MAX_DIVISION_QUEUE)
-		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
-		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
-
-		# Read back division queue count
-		glBindBuffer(GL_SHADER_STORAGE_BUFFER, global_counts_ssbo)
-		queue_count_data = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 4, UINT_SIZE)  # Read divisionQueueCount at offset 4
-		division_queue_count = np.frombuffer(queue_count_data, dtype=np.uint32)[0]
-		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
-
-		# Process division queue
-		if division_queue_count > 0:
-			process_division_queue.use()
-			process_division_queue.set_int("numCells", NUM_CELLS)
-			glDispatchCompute(min(int(division_queue_count), MAX_DIVISION_QUEUE) // 256 + 1, 1, 1)
+		if ENABLE_FEEDING:
+			# Food + Enqueue pass
+			food_enqueue.use()
+			food_enqueue.set_int("numCells", NUM_CELLS)
+			food_enqueue.set_float("foodPerFrame", delta_time / 10.0)  # Accumulates to 1.0 over 10 seconds
+			food_enqueue.set_float("foodThreshold", 1.0)
+			food_enqueue.set_int("maxDivisionQueue", MAX_DIVISION_QUEUE)
+			glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+			# Read back division queue count
+			glBindBuffer(GL_SHADER_STORAGE_BUFFER, global_counts_ssbo)
+			queue_count_data = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 4, UINT_SIZE)  # Read divisionQueueCount at offset 4
+			division_queue_count = np.frombuffer(queue_count_data, dtype=np.uint32)[0]
+			glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+
+			# Process division queue
+			if division_queue_count > 0:
+				division_happened = True
+				process_division_queue.use()
+				process_division_queue.set_int("numCells", NUM_CELLS)
+				glDispatchCompute(min(int(division_queue_count), MAX_DIVISION_QUEUE) // 256 + 1, 1, 1)
+				glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+		# Remove broken or one-way links introduced by concurrent topology edits.
+		sanitize_links.use()
+		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)
+		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
 		# Recompute linkCount
 		recompute_link_count.use()
@@ -382,10 +439,10 @@ def main():
 		# Physics pass
 		simulate.use()
 		simulate.set_float("linkRestLength", 0.6)  # Increased to match initial sphere spacing better
-		simulate.set_float("springFactor", 2.5 if enable_spring else 0.0)
-		simulate.set_float("planarFactor", 1.0 if enable_planar else 0.0)
-		simulate.set_float("bulgeFactor", 1.0 if enable_bulge else 0.0)
-		simulate.set_float("repulsionFactor", 0.08 if enable_repulsion else 0.0)
+		simulate.set_float("springFactor", spring_strength if enable_spring else 0.0)
+		simulate.set_float("planarFactor", planar_strength if enable_planar else 0.0)
+		simulate.set_float("bulgeFactor", bulge_strength if enable_bulge else 0.0)
+		simulate.set_float("repulsionFactor", repulsion_strength if enable_repulsion else 0.0)
 		simulate.set_float("repulsionRadius", 2)
 		simulate.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
 		simulate.set_float("timeStep", 0.005)
@@ -393,51 +450,56 @@ def main():
 		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
 		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
-		# Link healing pass
-		link_healing.use()
-		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
-		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+		healing_iterations = HEALING_ITERATIONS_AFTER_DIVISION if division_happened else 1
+		for _ in range(healing_iterations):
+			# Link healing pass
+			link_healing.use()
+			link_healing.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
+			link_healing.set_float("healingRadius", 1.25)
+			link_healing.set_int("targetNeighbors", 6)
+			glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 
-		# Recompute linkCount again after link healing
-		recompute_link_count.use()
-		glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
-		glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+			# Healing can race; sanitize and recount after each iteration.
+			sanitize_links.use()
+			glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)
+			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+			recompute_link_count.use()
+			glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)  # Ensure at least 1 work group
+			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
+
+		# Keep the whole structure centered so it doesn't drift out of view.
+		active_cells_now = int(read_active_cell_count(global_counts_ssbo))
+		sample_cells = max(1, min(active_cells_now, RECENTER_SAMPLE_CELLS))
+		centroid, color_max_distance = read_active_cell_stats(cell_ssbo, sample_cells)
+		centroid_len = np.linalg.norm(centroid)
+		if centroid_len > 1e-4:
+			recenter_cells.use()
+			recenter_cells.setVec3("centerOffset", glm.vec3(float(centroid[0]), float(centroid[1]), float(centroid[2])))
+			recenter_cells.setVec3("gridResolution", glm.vec3(GRID_RES, GRID_RES, GRID_RES))
+			recenter_cells.set_float("voxelSize", VOXEL_SIZE)
+			glDispatchCompute((NUM_CELLS + 255) // 256, 1, 1)
+			glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT)
 		j += 1
 		# Geometry pass
 		glBindFramebuffer(GL_FRAMEBUFFER, g_buffer)
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-		projection = glm.perspective(glm.radians(camera.Zoom), SCR_WIDTH / SCR_HEIGHT, 0.1, 50.0)
+		projection = glm.perspective(glm.radians(camera.Zoom), SCR_WIDTH / SCR_HEIGHT, 0.1, 100.0)
 		view = camera.get_view_matrix()
 		model = glm.mat4(1.0)
 
 		shader_geometry_pass.use()
 		shader_geometry_pass.setMat4("projection", projection)
 		shader_geometry_pass.setMat4("view", view)
-
-		# Render cube
-		model = glm.translate(model, glm.vec3(0.0, 7.0, 0.0))
-		model = glm.scale(model, glm.vec3(7.5))
-		shader_geometry_pass.setMat4("model", model)
-		shader_geometry_pass.set_int("invertedNormals", 1)
-		shader_geometry_pass.set_bool("useColor", True)
-		shader_geometry_pass.setVec3("color", glm.vec3(0.95))
-		shader_geometry_pass.set_bool("useSSBO", False)
-		render_cube()
-		if not only_ao:
-			shader_geometry_pass.set_bool("useColor", False)
-		shader_geometry_pass.set_int("invertedNormals", 0)
-
-		# Render backpack
-		model = glm.translate(glm.mat4(1.0), glm.vec3(0.0, 0.5, 0.0))
-		model = glm.rotate(model, glm.radians(-90.0), glm.vec3(1.0, 0.0, 0.0))
-		shader_geometry_pass.setMat4("model", model)
-		backpack.draw(shader_geometry_pass)
+		shader_geometry_pass.setVec3("cellColorCentroid", glm.vec3(float(centroid[0]), float(centroid[1]), float(centroid[2])))
+		shader_geometry_pass.set_float("cellColorMaxDistance", color_max_distance)
 
 		# Render cells
 		shader_geometry_pass.set_bool("useSSBO", True)
 		shader_geometry_pass.setMat4("model", glm.mat4(1.0))
 		glMemoryBarrier(GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT)
-		sphere.draw_instanced(NUM_CELLS)
+		sphere.draw_instanced(active_cells_now)
 
 
 		# SSAO pass
@@ -472,12 +534,10 @@ def main():
 		light_pos_view = glm.vec3(view * glm.vec4(light_pos, 1.0))
 		shader_lighting_pass.setVec3("light.Position", light_pos_view)
 		shader_lighting_pass.setVec3("light.Color", light_color)
-		shader_lighting_pass.set_float("light.Linear", 0.09)
-		shader_lighting_pass.set_float("light.Quadratic", 0.032)
-		if use_ssao:
-			shader_lighting_pass.set_bool("enableSSAO", True)
-		else:
-			shader_lighting_pass.set_bool("enableSSAO", False)
+		shader_lighting_pass.set_float("light.Linear", 0.045)
+		shader_lighting_pass.set_float("light.Quadratic", 0.0075)
+		shader_lighting_pass.set_bool("enableSSAO", use_ssao)
+		shader_lighting_pass.set_bool("enablePhong", use_phong)
 
 		glActiveTexture(GL_TEXTURE0)
 		glBindTexture(GL_TEXTURE_2D, g_position)
@@ -504,6 +564,114 @@ def create_ssbo(binding_index, size_in_bytes):
 	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding_index, ssbo)
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
 	return ssbo
+
+
+def initialize_cells_hex_sheet_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=666, capacity=None, link_rest_length=0.6, max_links=6):
+	if capacity is None:
+		capacity = num_cells
+	dtype = np.dtype([
+		('position', np.float32, 3),
+		('foodLevel', np.float32),
+		('voxelCoord', np.float32, 3),
+		('radius', np.float32),
+		('linkStartIndex', np.int32),
+		('linkCount', np.int32),
+		('flatVoxelIndex', np.int32),
+		('isActive', np.int32),
+	])
+
+	# Allocate full capacity; only first num_cells are active sheet cells
+	cells = np.zeros(capacity, dtype=dtype)
+
+	def hex_ring_coords(limit):
+		coords = []
+		radius = 0
+		while len(coords) < limit:
+			for q in range(-radius, radius + 1):
+				for r in range(-radius, radius + 1):
+					s = -q - r
+					if max(abs(q), abs(r), abs(s)) == radius:
+						coords.append((q, r))
+						if len(coords) >= limit:
+							return coords
+			radius += 1
+		return coords
+
+	axial_coords = hex_ring_coords(num_cells)
+	coord_to_index = {coord: idx for idx, coord in enumerate(axial_coords)}
+
+	# Hex lattice on XZ plane with nearest-neighbor spacing equal to link_rest_length.
+	# Basis vectors: a=(d,0), b=(d/2, d*sqrt(3)/2)
+	d = float(link_rest_length)
+	z_scale = d * (np.sqrt(3.0) / 2.0)
+
+	positions = np.zeros((num_cells, 3), dtype=np.float32)
+	for i, (q, r) in enumerate(axial_coords):
+		x = d * (q + 0.5 * r)
+		z = z_scale * r
+		positions[i] = np.array([x, 0.0, z], dtype=np.float32)
+
+	# Center the sheet at the origin.
+	positions -= np.mean(positions, axis=0, keepdims=True)
+
+	neighbor_offsets = [
+		(1, 0),
+		(-1, 0),
+		(0, 1),
+		(0, -1),
+		(1, -1),
+		(-1, 1),
+	]
+
+	adjacency = [set() for _ in range(num_cells)]
+	for i, (q, r) in enumerate(axial_coords):
+		for dq, dr in neighbor_offsets:
+			j = coord_to_index.get((q + dq, r + dr))
+			if j is not None:
+				adjacency[i].add(j)
+
+	for i in range(num_cells):
+		pos = positions[i]
+		vox_coord = np.floor(pos / VOXEL_SIZE)
+		flat_voxel_offset = GRID_RES // 2
+		shifted_flat_vox = vox_coord + flat_voxel_offset
+
+		cells[i]['position'] = pos
+		cells[i]['foodLevel'] = 0.0
+		cells[i]['voxelCoord'] = vox_coord
+		cells[i]['radius'] = 0.3
+		cells[i]['linkStartIndex'] = i * max_links
+		cells[i]['linkCount'] = len(adjacency[i])
+		if np.any(shifted_flat_vox < 0) or np.any(shifted_flat_vox >= GRID_RES):
+			cells[i]['flatVoxelIndex'] = -1
+		else:
+			cells[i]['flatVoxelIndex'] = int(shifted_flat_vox[0] + shifted_flat_vox[1] * GRID_RES + shifted_flat_vox[2] * GRID_RES * GRID_RES)
+		cells[i]['isActive'] = 1
+
+	for i in range(num_cells, capacity):
+		cells[i]['isActive'] = 0
+		cells[i]['linkStartIndex'] = i * max_links
+		cells[i]['linkCount'] = 0
+
+	# Build the flat link array for full capacity (inactive slots have EMPTY links)
+	links = np.full(capacity * max_links, -1, dtype=np.int32)
+	for i in range(num_cells):
+		neighbors = sorted(list(adjacency[i]))
+		for k, n in enumerate(neighbors[:max_links]):
+			links[i * max_links + k] = n
+
+	global_counts = np.array([num_cells, 0], dtype=np.uint32)  # numActiveCells, divisionQueueCount
+
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, cell_ssbo)
+	glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, cells.nbytes, cells)
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, link_ssbo)
+	glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, links.nbytes, links)
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, global_counts_ssbo)
+	glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, global_counts.nbytes, global_counts)
 
 
 def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_counts_ssbo, num_cells=512, capacity=None, sphere_radius=1, max_links=6):
@@ -535,7 +703,7 @@ def initialize_cells_hollow_sphere_with_links(cell_ssbo, link_ssbo, global_count
 		shifted_flat_vox = vox_coord + flat_voxel_offset
 		cells[i]['position'] = pos
 		cells[i]['voxelCoord'] = vox_coord
-		cells[i]['radius'] = 0.1
+		cells[i]['radius'] = 0.3
 		cells[i]['linkStartIndex'] = i * max_links
 		cells[i]['linkCount'] = max_links
 		cells[i]['flatVoxelIndex'] = int(shifted_flat_vox[0] + shifted_flat_vox[1] * GRID_RES + shifted_flat_vox[2] * GRID_RES * GRID_RES)
@@ -724,6 +892,10 @@ def render_quad():
 
 def process_input(window, camera, delta_time):
 	global cursor_disabled, last_x, last_y, e_pressed
+	move_delta = delta_time
+	if glfw.get_key(window, glfw.KEY_LEFT_CONTROL) == glfw.PRESS or glfw.get_key(window, glfw.KEY_RIGHT_CONTROL) == glfw.PRESS:
+		move_delta *= 3.0
+
 	if glfw.get_key(window, glfw.KEY_ESCAPE) == glfw.PRESS:
 		glfw.set_window_should_close(window, True)
 	if glfw.get_key(window, glfw.KEY_E) == glfw.PRESS:
@@ -741,17 +913,17 @@ def process_input(window, camera, delta_time):
 	if not cursor_disabled:
 		return
 	if glfw.get_key(window, glfw.KEY_W) == glfw.PRESS:
-		camera.process_keyboard(Camera_Movement.FORWARD, delta_time)
+		camera.process_keyboard(Camera_Movement.FORWARD, move_delta)
 	if glfw.get_key(window, glfw.KEY_S) == glfw.PRESS:
-		camera.process_keyboard(Camera_Movement.BACKWARD, delta_time)
+		camera.process_keyboard(Camera_Movement.BACKWARD, move_delta)
 	if glfw.get_key(window, glfw.KEY_A) == glfw.PRESS:
-		camera.process_keyboard(Camera_Movement.LEFT, delta_time)
+		camera.process_keyboard(Camera_Movement.LEFT, move_delta)
 	if glfw.get_key(window, glfw.KEY_D) == glfw.PRESS:
-		camera.process_keyboard(Camera_Movement.RIGHT, delta_time)
+		camera.process_keyboard(Camera_Movement.RIGHT, move_delta)
 	if glfw.get_key(window, glfw.KEY_SPACE) == glfw.PRESS:
-		camera.process_keyboard(Camera_Movement.UP, delta_time)
+		camera.process_keyboard(Camera_Movement.UP, move_delta)
 	if glfw.get_key(window, glfw.KEY_LEFT_SHIFT) == glfw.PRESS:
-		camera.process_keyboard(Camera_Movement.DOWN, delta_time)
+		camera.process_keyboard(Camera_Movement.DOWN, move_delta)
 
 
 def framebuffer_size_callback(window, width, height):

@@ -4,7 +4,7 @@ layout(local_size_x = 256) in;
 struct Cell {
     vec3 position;       // 16 bytes (vec3 + padding)
     float foodLevel;     // 4  (included in above 16)
-    uvec3 voxelCoord;     // 16 bytes
+    vec3 voxelCoord;     // 16 bytes
     float radius;        // 4
     int linkStartIndex;  // 4
     int linkCount;       // 4
@@ -35,7 +35,8 @@ void main() {
     if (id >= cells.length()) return;
     if (cells[id].isActive == 0) return; // Skip inactive cells
     int voxelIdx = cells[id].flatVoxelIndex;
-    if (voxelIdx < 0 || voxelIdx >= gridResolution.x * gridResolution.y * gridResolution.z) {
+    int voxelCount = int(gridResolution.x * gridResolution.y * gridResolution.z);
+    if (voxelIdx < 0 || voxelIdx >= voxelCount) {
         // Invalid voxel index, skip processing
         return;
     }

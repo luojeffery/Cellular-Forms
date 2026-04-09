@@ -24,9 +24,12 @@ layout (location = 2) in vec2 aTexCoords;
 out vec3 FragPos;
 out vec2 TexCoords;
 out vec3 Normal;
+out vec3 CellColor;
 
 uniform bool invertedNormals;
 uniform bool useSSBO;
+uniform vec3 cellColorCentroid;
+uniform float cellColorMaxDistance;
 
 uniform mat4 model;
 uniform mat4 view;
@@ -35,6 +38,7 @@ uniform mat4 projection;
 void main()
 {
     vec3 finalPosition;
+    CellColor = vec3(1.0);
     Cell cell = cells[gl_InstanceID];
     if (useSSBO) {
         if (cell.isActive == 0) {
@@ -43,6 +47,10 @@ void main()
         else {
             vec3 instancePos = cell.position;
             float radius = cell.radius;
+            float normalizedDistance = clamp(length(instancePos - cellColorCentroid) / max(cellColorMaxDistance, 1e-4), 0.0, 1.0);
+            vec3 innerColor = vec3(1.0, 1.0, 0.0);
+            vec3 outerColor = vec3(0.0, 0.55, 1.0);
+            CellColor = mix(innerColor, outerColor, normalizedDistance);
             finalPosition = aPos * radius + instancePos + vec3(0, 5, 0);
         }
     }

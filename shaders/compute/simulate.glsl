@@ -27,6 +27,10 @@ layout(std430, binding = 3) buffer StartIndexPerVoxel {
 layout(std430, binding = 4) buffer FlatVoxelCellIDs {
     uint flatVoxelCellIDs[];
 };
+layout(std430, binding = 5) buffer GlobalCounts {
+    uint numActiveCells;
+    uint divisionQueueCount;
+};
 
 uniform float linkRestLength;
 uniform float springFactor;
@@ -39,6 +43,15 @@ uniform float timeStep;
 uniform float voxelSize;
 
 const uint EMPTY = 0xFFFFFFFFu;
+const int MAX_NEIGHBORS = 6;
+
+vec3 safeNormalize(vec3 v, vec3 fallback) {
+    float len2 = dot(v, v);
+    if (len2 > 1e-8) {
+        return v * inversesqrt(len2);
+    }
+    return fallback;
+}
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
@@ -46,7 +59,6 @@ void main() {
     if (id >= cells.length() || cells[id].isActive == 0) return;
 
     vec3 P = cells[id].position;
-    int linkCount = cells[id].linkCount;
     int linkBase = cells[id].linkStartIndex;
 
     // --- DIRECT FORCES (spring, planar, bulge) ---
@@ -56,13 +68,16 @@ void main() {
     float bulgeDist = 0.0;
     int validCount = 0;
 
-    for (int i = 0; i < 6; ++i) {
-        if (i >= linkCount) continue;
+    uint neighborIDs[MAX_NEIGHBORS];
+    vec3 neighborRel[MAX_NEIGHBORS];
+
+    vec3 radialFallback = safeNormalize(P, vec3(0.0, 1.0, 0.0));
+
+    for (int i = 0; i < MAX_NEIGHBORS; ++i) {
         uint neighborIndex = links[linkBase + i];
-        if (neighborIndex == EMPTY) continue;
+        if (neighborIndex == EMPTY || neighborIndex >= cells.length() || cells[neighborIndex].isActive == 0) continue;
         vec3 L = cells[neighborIndex].position;
-        vec3 toNeighbor = L - P;
-        float distToNeighbor = length(toNeighbor);
+        vec3 rel = L - P;
 
         // Planar target: average of neighbor positions (paper formula)
         planarTarget += L;
@@ -70,10 +85,11 @@ void main() {
         // Spring target: for each link, target position is neighbor + restLength * direction from neighbor to cell
         // Paper: springTarget = 1/n * sum(Lr + linkRestLength * normalize(P - Lr))
         // Note: normalize(P - L) is direction FROM neighbor L TO cell P
-        vec3 dirFromNeighborToCell = normalize(P - L);
-        if (length(P - L) > 0.001) {  // Avoid division by zero
-            springTarget += L + linkRestLength * dirFromNeighborToCell;
-        }
+        vec3 dirFromNeighborToCell = safeNormalize(P - L, radialFallback);
+        springTarget += L + linkRestLength * dirFromNeighborToCell;
+
+        neighborIDs[validCount] = neighborIndex;
+        neighborRel[validCount] = rel;
         validCount++;
     }
 
@@ -82,95 +98,111 @@ void main() {
         springTarget /= float(validCount);
     }
 
-    // For a sphere centered at origin, use position vector as normal
-    // This ensures symmetric expansion and prevents bias
-    normal = normalize(P);
-    if (length(P) < 0.001) {
-        normal = vec3(0.0, 1.0, 0.0); // Avoid division by zero at origin
+    // Paper-style local normal from pairs of linked neighbors around P.
+    vec3 normalSum = vec3(0.0);
+    int normalPairCount = 0;
+    for (int i = 0; i < validCount; ++i) {
+        for (int j = i + 1; j < validCount; ++j) {
+            vec3 cp = cross(neighborRel[i], neighborRel[j]);
+            float cpLen2 = dot(cp, cp);
+            if (cpLen2 > 1e-10) {
+                normalSum += cp * inversesqrt(cpLen2);
+                normalPairCount++;
+            }
+        }
     }
 
-    validCount = 0;
-    for (int i = 0; i < 6; ++i) {
-        if (i >= linkCount) continue;
-        uint neighborIndex = links[linkBase + i];
-        if (neighborIndex == EMPTY) continue;
-        vec3 L = cells[neighborIndex].position;
-
-        float dotNr = dot(L - P, normal);
-        float LLen = length(L - P);
-        bulgeDist += sqrt(max(0.0, linkRestLength * linkRestLength - LLen * LLen + dotNr * dotNr)) + dotNr;
-        validCount++;
+    if (normalPairCount > 0) {
+        if (dot(normalSum, radialFallback) < 0.0) {
+            normalSum = -normalSum;
+        }
+        normal = safeNormalize(normalSum, radialFallback);
+    } else if (validCount > 0) {
+        normal = safeNormalize(P - planarTarget, radialFallback);
+    } else {
+        normal = radialFallback;
     }
 
-    if (validCount > 0) {
+    // Bulge target from intersections of P's normal with rest-length spheres around neighbor pairs.
+    float bulgeAccum = 0.0;
+    int bulgePairCount = 0;
+    for (int i = 0; i < validCount; ++i) {
+        float dotNi = dot(neighborRel[i], normal);
+        float discI = linkRestLength * linkRestLength - dot(neighborRel[i], neighborRel[i]) + dotNi * dotNi;
+        if (discI <= 0.0) {
+            continue;
+        }
+
+        for (int j = i + 1; j < validCount; ++j) {
+            float dotNj = dot(neighborRel[j], normal);
+            float discJ = linkRestLength * linkRestLength - dot(neighborRel[j], neighborRel[j]) + dotNj * dotNj;
+            if (discJ <= 0.0) {
+                continue;
+            }
+
+            float t1 = dotNi + sqrt(discI);
+            float t2 = dotNj + sqrt(discJ);
+            bulgeAccum += 0.5 * (t1 + t2);
+            bulgePairCount++;
+        }
+    }
+
+    if (bulgePairCount > 0) {
+        bulgeDist = bulgeAccum / float(bulgePairCount);
+    } else if (validCount > 0) {
+        // Fallback when there are too few valid pairs.
+        for (int i = 0; i < validCount; ++i) {
+            float dotNi = dot(neighborRel[i], normal);
+            float discI = linkRestLength * linkRestLength - dot(neighborRel[i], neighborRel[i]) + dotNi * dotNi;
+            if (discI > 0.0) {
+                bulgeDist += dotNi + sqrt(discI);
+            }
+        }
         bulgeDist /= float(validCount);
     }
+
+    // Negative bulge pulls cells inward and tends to fill the interior volume.
+    bulgeDist = max(0.0, bulgeDist);
 
     vec3 bulgeTarget = P + bulgeDist * normal;
 
     vec3 totalTarget;
     if (repulsionFactor != 0) {
         vec3 collisionOffset = vec3(0.0);
-        uint indirectCells[100];  // Increased for neighbor voxels
-        uint indirectCount = 0;
+        float roiSquared = repulsionRadius * repulsionRadius;
 
-        // Check current voxel and all 26 neighboring voxels (3x3x3 - 1)
-        ivec3 currentVoxel = ivec3(cells[id].voxelCoord) + ivec3(gridResolution) / 2;
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dy = -1; dy <= 1; dy++) {
-                for (int dz = -1; dz <= 1; dz++) {
-                    ivec3 neighborVoxel = currentVoxel + ivec3(dx, dy, dz);
-                    neighborVoxel = clamp(neighborVoxel, ivec3(0), ivec3(gridResolution) - ivec3(1));
-                    uint neighborFlatVoxel = uint(neighborVoxel.x + neighborVoxel.y * int(gridResolution.x) + neighborVoxel.z * int(gridResolution.x) * int(gridResolution.y));
-                    
-                    uint startIndex = startIndexPerVoxel[neighborFlatVoxel];
-                    uint count = cellCountPerVoxel[neighborFlatVoxel];
-                    
-                    for (uint i = startIndex; i < startIndex + count && indirectCount < 100; i++) {
-                        uint candidate = flatVoxelCellIDs[i];
-                        if (candidate == id) continue;
+        // Global active-cell scan for repulsion (voxel-independent).
+        // This avoids edge artifacts from finite voxel grids.
+        uint activeCount = min(numActiveCells, uint(cells.length()));
+        for (uint candidate = 0u; candidate < activeCount; ++candidate) {
+            if (candidate == id || cells[candidate].isActive == 0) {
+                continue;
+            }
 
-                        bool isDirect = false;
-                        for (uint j = 0; j < cells[id].linkCount; j++) {
-                            if (links[cells[id].linkStartIndex + j] == candidate) {
-                                isDirect = true;
-                                break;
-                            }
-                        }
-
-                        if (!isDirect) {
-                            // Check if already added
-                            bool alreadyAdded = false;
-                            for (uint k = 0; k < indirectCount; k++) {
-                                if (indirectCells[k] == candidate) {
-                                    alreadyAdded = true;
-                                    break;
-                                }
-                            }
-                            if (!alreadyAdded) {
-                                indirectCells[indirectCount++] = candidate;
-                            }
-                        }
-                    }
+            bool isDirect = false;
+            for (int j = 0; j < 6; ++j) {
+                if (links[linkBase + j] == candidate) {
+                    isDirect = true;
+                    break;
                 }
             }
-        }
-        
-        for (uint i = 0; i < indirectCount; i++) {
-            vec3 diff = cells[id].position - cells[indirectCells[i]].position;
+            if (isDirect) {
+                continue;
+            }
+
+            vec3 diff = P - cells[candidate].position;
             float dist2 = dot(diff, diff);
-            float roiSquared = repulsionRadius * repulsionRadius;
-            if (dist2 < roiSquared && dist2 > 0.5)
+            if (dist2 < roiSquared && dist2 > 1e-8) {
                 collisionOffset += repulsionFactor * ((roiSquared - dist2) / roiSquared) * normalize(diff);
+            }
         }
 
         // Planar force pulls toward average of neighbors, which on a sphere causes drift
         // Make planar force tangential to sphere surface to prevent radial drift
         vec3 planarOffset = planarTarget - P;
-        vec3 radialDir = normalize(P);
-        if (length(P) > 0.001) {
-            float radialComponent = dot(planarOffset, radialDir);
-            vec3 tangentialPlanarOffset = planarOffset - radialComponent * radialDir;
+        if (dot(normal, normal) > 1e-8) {
+            float normalComponent = dot(planarOffset, normal);
+            vec3 tangentialPlanarOffset = planarOffset - normalComponent * normal;
             totalTarget = P
                 + springFactor * (springTarget - P)
                 + planarFactor * tangentialPlanarOffset  // Only tangential component
@@ -188,10 +220,9 @@ void main() {
         // Planar force pulls toward average of neighbors, which on a sphere causes drift
         // Make planar force tangential to sphere surface to prevent radial drift
         vec3 planarOffset = planarTarget - P;
-        vec3 radialDir = normalize(P);
-        if (length(P) > 0.001) {
-            float radialComponent = dot(planarOffset, radialDir);
-            vec3 tangentialPlanarOffset = planarOffset - radialComponent * radialDir;
+        if (dot(normal, normal) > 1e-8) {
+            float normalComponent = dot(planarOffset, normal);
+            vec3 tangentialPlanarOffset = planarOffset - normalComponent * normal;
             totalTarget = P
                 + springFactor * (springTarget - P)
                 + planarFactor * tangentialPlanarOffset  // Only tangential component
@@ -210,9 +241,11 @@ void main() {
     cells[id].voxelCoord = floor(cells[id].position / voxelSize);
     ivec3 voxel_offset = ivec3(gridResolution) / 2;
     ivec3 shiftedVoxel = ivec3(cells[id].voxelCoord) + voxel_offset;
-    // Clamp to valid voxel grid bounds
-    shiftedVoxel = clamp(shiftedVoxel, ivec3(0), ivec3(gridResolution) - ivec3(1));
-    cells[id].flatVoxelIndex = int(shiftedVoxel.x +
-                              shiftedVoxel.y * gridResolution.x +
-                              shiftedVoxel.z * gridResolution.x * gridResolution.y);
+    if (any(lessThan(shiftedVoxel, ivec3(0))) || any(greaterThanEqual(shiftedVoxel, ivec3(gridResolution)))) {
+        cells[id].flatVoxelIndex = -1;
+    } else {
+        cells[id].flatVoxelIndex = int(shiftedVoxel.x +
+                                  shiftedVoxel.y * gridResolution.x +
+                                  shiftedVoxel.z * gridResolution.x * gridResolution.y);
+    }
 }

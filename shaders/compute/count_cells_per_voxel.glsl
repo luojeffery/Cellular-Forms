@@ -25,5 +25,6 @@ void main() {
     if (id >= cells.length()) return;
     if (cells[id].isActive == 0) return; // skip inactive cells
     int voxelIdx = cells[id].flatVoxelIndex;
+    if (voxelIdx < 0 || voxelIdx >= cellCountPerVoxel.length()) return;
     atomicAdd(cellCountPerVoxel[voxelIdx], 1); // we found a voxel to be surrounding this cell
 }

@@ -13,14 +13,16 @@ int kernelSize = 64;
 float radius = 0.5;
 float bias = 0.025;
 
-const vec2 noiseScale = vec2(800.0/4.0, 600.0/4.0);
+// noiseScale derived at runtime from actual framebuffer size
 
 uniform mat4 projection;
 
 void main()
 {
     vec3 fragPos = texture(gPosition, TexCoords).xyz;
+    if (fragPos.z == 0.0) { FragColor = 1.0; return; }  // no geometry here
     vec3 normal = normalize(texture(gNormal, TexCoords).rgb);
+    vec2 noiseScale = vec2(textureSize(gPosition, 0)) / 4.0;
     vec3 randomVec = normalize(texture(texNoise, TexCoords * noiseScale).xyz);
 
     // create TBN change-of-basis matrix: from tangent-space to view-space
@@ -43,13 +45,19 @@ void main()
         offset.xyz = offset.xyz * 0.5 + 0.5; // transform to range 0.0 - 1.0
 
         // get sample depth
-        float sampleDepth = texture(gPosition, offset.xy).z; // get depth value of kernel sample
+        vec3 sampleFragPos = texture(gPosition, offset.xy).xyz;
+        float sampleDepth = sampleFragPos.z; // get depth value of kernel sample
 
         // range check & accumulate
-        float rangeCheck = smoothstep(0.0, 1.0, radius / abs(fragPos.z - sampleDepth));
-        occlusion += (sampleDepth >= samplePos.z + bias ? 1.0 : 0.0) * rangeCheck;
+        float depthDelta = abs(fragPos.z - sampleDepth);
+        float rangeCheck = smoothstep(0.0, 1.0, radius / max(depthDelta, 1e-4));
+
+        float isOccluded = (sampleDepth >= samplePos.z + bias ? 1.0 : 0.0);
+        occlusion += isOccluded * rangeCheck;
     }
     occlusion = 1.0 - (occlusion / kernelSize);
+    // Increase AO contrast so occluded regions read clearly in the final lighting pass.
+    occlusion = pow(clamp(occlusion, 0.0, 1.0), 2.8);
 
     FragColor = occlusion;
 }

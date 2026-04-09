@@ -27,58 +27,154 @@ layout(std430, binding = 3) buffer StartIndexPerVoxel {
 layout(std430, binding = 4) buffer FlatVoxelCellIDs {
     uint flatVoxelCellIDs[];
 };
+layout(std430, binding = 5) buffer GlobalCounts {
+    uint numActiveCells;
+    uint divisionQueueCount;
+};
 
 const uint EMPTY = 0xFFFFFFFFu;
+const int MAX_NEIGHBORS = 6;
+const float MIN_NORMAL_ALIGNMENT = 0.35;
+const float MAX_RADIAL_SEPARATION = 0.45;
+
+uniform vec3 gridResolution;
+uniform float healingRadius;
+uniform int targetNeighbors;
+
+vec3 safeNormalize(vec3 v, vec3 fallback) {
+    float len2 = dot(v, v);
+    if (len2 > 1e-8) {
+        return v * inversesqrt(len2);
+    }
+    return fallback;
+}
+
+bool has_link(int base, uint otherID) {
+    for (int j = 0; j < MAX_NEIGHBORS; ++j) {
+        if (links[base + j] == otherID) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int find_empty_slot(int base) {
+    for (int j = 0; j < MAX_NEIGHBORS; ++j) {
+        if (links[base + j] == EMPTY) {
+            return base + j;
+        }
+    }
+    return -1;
+}
+
+vec3 estimate_local_normal(uint cellID) {
+    vec3 P = cells[cellID].position;
+    int base = cells[cellID].linkStartIndex;
+    vec3 radialFallback = safeNormalize(P, vec3(0.0, 1.0, 0.0));
+
+    vec3 rel[MAX_NEIGHBORS];
+    int relCount = 0;
+    vec3 neighborPosSum = vec3(0.0);
+
+    for (int i = 0; i < MAX_NEIGHBORS; ++i) {
+        uint n = links[base + i];
+        if (n == EMPTY || n >= cells.length() || cells[n].isActive == 0) {
+            continue;
+        }
+        vec3 L = cells[n].position;
+        rel[relCount++] = L - P;
+        neighborPosSum += L;
+    }
+
+    if (relCount >= 2) {
+        vec3 normalSum = vec3(0.0);
+        for (int i = 0; i < relCount; ++i) {
+            for (int j = i + 1; j < relCount; ++j) {
+                vec3 cp = cross(rel[i], rel[j]);
+                float cpLen2 = dot(cp, cp);
+                if (cpLen2 > 1e-10) {
+                    normalSum += cp * inversesqrt(cpLen2);
+                }
+            }
+        }
+        if (dot(normalSum, normalSum) > 1e-8) {
+            if (dot(normalSum, radialFallback) < 0.0) {
+                normalSum = -normalSum;
+            }
+            return safeNormalize(normalSum, radialFallback);
+        }
+    }
+
+    if (relCount > 0) {
+        vec3 avg = neighborPosSum / float(relCount);
+        return safeNormalize(P - avg, radialFallback);
+    }
+    return radialFallback;
+}
 
 void main() {
     uint id = gl_GlobalInvocationID.x;
 
     if (id >= cells.length() || cells[id].isActive == 0) return;
+    if (cells[id].linkCount >= targetNeighbors) return;
 
-    int voxID = cells[id].flatVoxelIndex;
-    uint startID = startIndexPerVoxel[voxID];
     int selfLinkStart = cells[id].linkStartIndex;
+    if (find_empty_slot(selfLinkStart) == -1) return;
 
-    for (uint idx = startID; idx < startID + int(cellCountPerVoxel[voxID]); idx++) {
-        uint otherID = flatVoxelCellIDs[idx];
-        if (otherID == id) continue;
-        if (cells[otherID].isActive == 0) continue; // Skip inactive cells
+    vec3 selfPos = cells[id].position;
+    vec3 selfNormal = estimate_local_normal(id);
+
+    float healingRadius2 = healingRadius * healingRadius;
+    uint bestOtherID = EMPTY;
+    float bestScore = 1e30;
+
+    uint activeCount = min(numActiveCells, uint(cells.length()));
+    for (uint otherID = 0u; otherID < activeCount; ++otherID) {
+        if (otherID == id || otherID >= cells.length()) continue;
+        if (cells[otherID].isActive == 0) continue;
+        if (cells[otherID].linkCount >= targetNeighbors) continue;
+        if (find_empty_slot(cells[otherID].linkStartIndex) == -1) continue;
+
+        vec3 otherNormal = estimate_local_normal(otherID);
+        if (dot(selfNormal, otherNormal) < MIN_NORMAL_ALIGNMENT) continue;
+
+        vec3 delta = cells[otherID].position - selfPos;
+        float radialSeparation = abs(dot(delta, selfNormal));
+        if (radialSeparation > MAX_RADIAL_SEPARATION) continue;
+
+        vec3 tangentialDelta = delta - dot(delta, selfNormal) * selfNormal;
+        float tangentialDist2 = dot(tangentialDelta, tangentialDelta);
+        if (tangentialDist2 > healingRadius2) continue;
+
         int otherLinkStart = cells[otherID].linkStartIndex;
+        if (has_link(selfLinkStart, otherID) || has_link(otherLinkStart, id)) continue;
 
-        // Check if already linked
-        bool alreadyLinked = false;
-        for (int j = 0; j < 6; ++j) {
-            if (links[selfLinkStart + j] == int(otherID)) {
-                alreadyLinked = true;
-                break;
-            }
+        float score = tangentialDist2 + 0.25 * radialSeparation * radialSeparation;
+        if (score < bestScore) {
+            bestScore = score;
+            bestOtherID = otherID;
         }
+    }
 
-        if (alreadyLinked) continue;
+    if (bestOtherID == EMPTY) {
+        return;
+    }
 
-        // Find empty spot in self
-        int selfEmpty = -1;
-        for (int j = 0; j < 6; ++j) {
-            if (links[selfLinkStart + j] == EMPTY) {
-                selfEmpty = selfLinkStart + j;
-                break;
-            }
-        }
+    int otherLinkStart = cells[bestOtherID].linkStartIndex;
+    if (has_link(selfLinkStart, bestOtherID) || has_link(otherLinkStart, id)) {
+        return;
+    }
 
-        // Find empty spot in other
-        int otherEmpty = -1;
-        for (int j = 0; j < 6; ++j) {
-            if (links[otherLinkStart + j] == EMPTY) {
-                otherEmpty = otherLinkStart + j;
-                break;
-            }
-        }
+    int selfEmpty = find_empty_slot(selfLinkStart);
+    int otherEmpty = find_empty_slot(otherLinkStart);
+    if (selfEmpty == -1 || otherEmpty == -1) {
+        return;
+    }
 
-        // Only link if both have space
-        if (selfEmpty != -1 && otherEmpty != -1) {
-            links[selfEmpty] = otherID;
-            links[otherEmpty] = id;
-            // Note: linkCount will be recomputed in next recompute pass
-        }
+    if (atomicCompSwap(links[selfEmpty], EMPTY, bestOtherID) != EMPTY) {
+        return;
+    }
+    if (atomicCompSwap(links[otherEmpty], EMPTY, id) != EMPTY) {
+        links[selfEmpty] = EMPTY;
     }
 }

@@ -40,21 +40,6 @@ class Model:
 				id = self.texture_from_file(path)
 				textures.append(Texture(id, type, path))
 
-				path = r"objects\backpack\specular.jpg"
-				type = "texture_specular"
-				id = self.texture_from_file(path)
-				textures.append(Texture(id, type, path))
-
-				path = r"objects\backpack\normal.png"
-				id = self.texture_from_file(path)
-				type = "texture_normal"
-				textures.append(Texture(id, type, path))
-
-				path = r"objects\backpack\roughness.jpg"
-				id = self.texture_from_file(path)
-				type = "texture_height"
-				textures.append(Texture(id, type, path))
-
 		return Mesh(vertices, indices, textures)
 
 	def texture_from_file(self, path) -> int:

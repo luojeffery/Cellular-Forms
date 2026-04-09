@@ -45,6 +45,14 @@ float randFloat(uint seed) {
     return float(hash(seed) & 0xFFFFu) / float(0xFFFFu); // in [0.0, 1.0)
 }
 
+vec3 safeNormalize(vec3 v, vec3 fallback) {
+    float len2 = dot(v, v);
+    if (len2 > 1e-8) {
+        return v * inversesqrt(len2);
+    }
+    return fallback;
+}
+
 void main() {
     uint queueIndex = gl_GlobalInvocationID.x;
     
@@ -64,13 +72,38 @@ void main() {
 
     // Initialize daughter cell
     cells[newIndex].isActive = 1;
-    float rx = randFloat(parentId * 3u + 0u) * 2.0 - 1.0;
-    float ry = randFloat(parentId * 3u + 1u) * 2.0 - 1.0;
-    float rz = randFloat(parentId * 3u + 2u) * 2.0 - 1.0;
+    float rx = randFloat(parentId * 7u + 0u) * 2.0 - 1.0;
+    float ry = randFloat(parentId * 7u + 1u) * 2.0 - 1.0;
+    float rz = randFloat(parentId * 7u + 2u) * 2.0 - 1.0;
+    float tx = randFloat(parentId * 7u + 3u) * 2.0 - 1.0;
+    float ty = randFloat(parentId * 7u + 4u) * 2.0 - 1.0;
+    float tz = randFloat(parentId * 7u + 5u) * 2.0 - 1.0;
 
-    vec3 randomOffset = 0.1 * normalize(vec3(rx, ry, rz));
-    cells[newIndex].position = cells[parentId].position + randomOffset;
-    cells[newIndex].radius = 0.1;
+    int parentBase = cells[parentId].linkStartIndex;
+    vec3 parentPos = cells[parentId].position;
+
+    // Estimate outward surface normal from local neighborhood to keep growth on the shell.
+    vec3 normalSum = vec3(0.0);
+    for (int i = 0; i < 6; i++) {
+        uint neighbor = links[parentBase + i];
+        if (neighbor == EMPTY || neighbor >= cells.length() || cells[neighbor].isActive == 0) {
+            continue;
+        }
+        normalSum += safeNormalize(parentPos - cells[neighbor].position, vec3(0.0, 1.0, 0.0));
+    }
+
+    vec3 radialFallback = safeNormalize(parentPos, vec3(0.0, 1.0, 0.0));
+    vec3 outward = safeNormalize(normalSum, radialFallback);
+    vec3 randomVec = safeNormalize(vec3(rx, ry, rz), radialFallback);
+
+    // Tangential jitter helps break symmetry without sending daughter deep into the volume.
+    vec3 tangent = randomVec - dot(randomVec, outward) * outward;
+    tangent = safeNormalize(tangent, vec3(1.0, 0.0, 0.0));
+    float tangentSign = (randFloat(parentId * 7u + 6u) < 0.5) ? -1.0 : 1.0;
+
+    vec3 splitOffset = 0.08 * outward + 0.03 * tangentSign * tangent;
+    cells[newIndex].position = parentPos + splitOffset;
+    cells[newIndex].radius = 0.3;
     cells[newIndex].voxelCoord = cells[parentId].voxelCoord;
     cells[newIndex].flatVoxelIndex = cells[parentId].flatVoxelIndex;
     cells[newIndex].linkStartIndex = int(newIndex * 6);
@@ -83,7 +116,6 @@ void main() {
     }
 
     // Step 1: Sever half of parent's links and assign to daughter
-    int parentBase = cells[parentId].linkStartIndex;
     int daughterBase = cells[newIndex].linkStartIndex;
     int linksToSever = cells[parentId].linkCount / 2;
     uint neighbors[6]; // Max 6 neighbors

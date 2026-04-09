@@ -10,12 +10,16 @@ uniform vec3 color;
 in vec2 TexCoords;
 in vec3 FragPos;
 in vec3 Normal;
+in vec3 CellColor;
+uniform bool useSSBO;
 
 void main()
 {
     gPosition = FragPos;
     gNormal = normalize(Normal);
-    if (useColor)
+    if (useSSBO)
+        gAlbedo.rgb = CellColor;
+    else if (useColor)
         gAlbedo.rgb = color;
     else
         gAlbedo.rgb = texture(texture_diffuse1, TexCoords).rgb;
