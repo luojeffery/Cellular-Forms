@@ -21,34 +21,23 @@ uniform bool enablePhong;
 void main()
 {
     vec3 FragPos = texture(gPosition, TexCoords).rgb;
+    if (FragPos.z == 0.0) discard;
+
     vec3 Normal = texture(gNormal, TexCoords).rgb;
     vec3 Diffuse = texture(gAlbedo, TexCoords).rgb;
-    float AmbientOcclusion = 1;
+    
+    float AmbientOcclusion = 1.0;
     if (enableSSAO)
         AmbientOcclusion = texture(ssao, TexCoords).r;
 
-    float aoLift = mix(0.05, 1.0, AmbientOcclusion);
-    vec3 ambient = 0.55 * Diffuse * aoLift;
-    vec3 lighting = ambient;
+    float ambientIntensity = 1.0;
+    vec3 color = Diffuse * ambientIntensity * AmbientOcclusion;
+    
     if (enablePhong) {
-        vec3 viewDir  = normalize(-FragPos); // assuming camera is at origin
-        // diffuse
-        vec3 lightDir = normalize(light.Position - FragPos);
-        vec3 diffuse = 1.25 * max(dot(Normal, lightDir), 0.0) * Diffuse * light.Color;
-        // specular (Blinn-Phong)
-        vec3 halfwayDir = normalize(lightDir + viewDir);
-        float spec = pow(max(dot(Normal, halfwayDir), 0.0), 8.0);
-        vec3 specular = 0.35 * light.Color * spec;
-        // attenuation
-        float distance = length(light.Position - FragPos);
-        float attenuation = 1.0 / (1.0 + light.Linear * distance + light.Quadratic * distance * distance);
-        diffuse *= attenuation;
-        specular *= attenuation;
-        lighting += diffuse + specular;
-        // Let AO influence direct light a bit so occlusion is perceptible beyond ambient only.
-        lighting *= mix(0.4, 1.0, AmbientOcclusion);
-        lighting *= 1.2;
+        vec3 up = vec3(0.0, 1.0, 0.0);
+        float hemiDiffuse = max(dot(Normal, up), 0.0) * 0.15;
+        color += Diffuse * hemiDiffuse * light.Color * AmbientOcclusion;
     }
 
-    FragColor = vec4(lighting, 1.0);
+    FragColor = vec4(color, 1.0);
 }

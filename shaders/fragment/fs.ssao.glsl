@@ -10,8 +10,8 @@ uniform sampler2D texNoise;
 uniform vec3 samples[64];
 
 int kernelSize = 64;
-float radius = 0.5;
-float bias = 0.025;
+float radius = 1.5;
+float bias = 0.035;
 
 // noiseScale derived at runtime from actual framebuffer size
 
@@ -57,7 +57,7 @@ void main()
     }
     occlusion = 1.0 - (occlusion / kernelSize);
     // Increase AO contrast so occluded regions read clearly in the final lighting pass.
-    occlusion = pow(clamp(occlusion, 0.0, 1.0), 2.8);
+    occlusion = pow(clamp(occlusion, 0.0, 1.0), 4.0);
 
     FragColor = occlusion;
 }

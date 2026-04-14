@@ -35,6 +35,9 @@ uniform mat4 model;
 uniform mat4 view;
 uniform mat4 projection;
 
+uniform bool enableClip;
+uniform vec4 clipPlane;  // (nx, ny, nz, d) in world space: dot(n, P) + d >= 0 => keep
+
 void main()
 {
     vec3 finalPosition;
@@ -47,17 +50,27 @@ void main()
         else {
             vec3 instancePos = cell.position;
             float radius = cell.radius;
-            float normalizedDistance = clamp(length(instancePos - cellColorCentroid) / max(cellColorMaxDistance, 1e-4), 0.0, 1.0);
-            vec3 innerColor = vec3(1.0, 1.0, 0.0);
-            vec3 outerColor = vec3(0.0, 0.55, 1.0);
-            CellColor = mix(innerColor, outerColor, normalizedDistance);
-            finalPosition = aPos * radius + instancePos + vec3(0, 5, 0);
+
+            // Per-instance cross-section: if the cell CENTER is on the
+            // clipped side of the plane, collapse the entire sphere to a
+            // degenerate point so no partial cuts are visible.
+            vec3 cellWorldCenter = (model * vec4(instancePos + vec3(0, 5, 0), 1.0)).xyz;
+            if (enableClip && dot(clipPlane.xyz, cellWorldCenter) + clipPlane.w < 0.0) {
+                finalPosition = vec3(0);
+            } else {
+                float normalizedDistance = clamp(length(instancePos - cellColorCentroid) / max(cellColorMaxDistance, 1e-4), 0.0, 1.0);
+                vec3 innerColor = vec3(1.0, 1.0, 0.0);
+                vec3 outerColor = vec3(0.0, 0.55, 1.0);
+                CellColor = mix(innerColor, outerColor, normalizedDistance);
+                finalPosition = aPos * radius + instancePos + vec3(0, 5, 0);
+            }
         }
     }
     else {
         finalPosition = aPos;
     }
-    vec4 viewPos = view * model * vec4(finalPosition, 1.0);
+    vec4 worldPos = model * vec4(finalPosition, 1.0);
+    vec4 viewPos = view * worldPos;
     FragPos = viewPos.xyz;
     TexCoords = aTexCoords;
 

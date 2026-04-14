@@ -20,7 +20,7 @@ layout(std430, binding = 1) buffer LinkBuffer {
 };
 
 const uint EMPTY = 0xFFFFFFFFu;
-const int MAX_NEIGHBORS = 6;
+const int MAX_NEIGHBORS = 8;
 
 bool has_reciprocal(uint selfId, uint otherId) {
     int otherBase = cells[otherId].linkStartIndex;

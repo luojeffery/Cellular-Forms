@@ -28,8 +28,14 @@ layout(std430, binding = 4) buffer FlatVoxelCellIDs {
     uint flatVoxelCellIDs[];
 };
 layout(std430, binding = 5) buffer GlobalCounts {
-    uint numActiveCells;
+    uint numActiveCells;      // Monotonic high-water mark
     uint divisionQueueCount;
+    uint trueActiveCount;     // Actual active cells (counted by food_enqueue)
+};
+// Position snapshot from before this dispatch — ensures all neighbor reads
+// see pre-update positions (synchronous Euler step, not Gauss-Seidel).
+layout(std430, binding = 8) readonly buffer PositionSnapshot {
+    vec4 posSnapshot[];
 };
 
 uniform float linkRestLength;
@@ -43,7 +49,7 @@ uniform float timeStep;
 uniform float voxelSize;
 
 const uint EMPTY = 0xFFFFFFFFu;
-const int MAX_NEIGHBORS = 6;
+const int MAX_NEIGHBORS = 8;
 
 vec3 safeNormalize(vec3 v, vec3 fallback) {
     float len2 = dot(v, v);
@@ -71,12 +77,14 @@ void main() {
     uint neighborIDs[MAX_NEIGHBORS];
     vec3 neighborRel[MAX_NEIGHBORS];
 
-    vec3 radialFallback = safeNormalize(P, vec3(0.0, 1.0, 0.0));
-
+    // Local outward hint: direction from neighbor centroid to cell.
+    // Works for folded/branching forms (unlike global radial direction).
+    vec3 neighborCentroidHint = vec3(0.0);
+    
     for (int i = 0; i < MAX_NEIGHBORS; ++i) {
         uint neighborIndex = links[linkBase + i];
         if (neighborIndex == EMPTY || neighborIndex >= cells.length() || cells[neighborIndex].isActive == 0) continue;
-        vec3 L = cells[neighborIndex].position;
+        vec3 L = posSnapshot[neighborIndex].xyz;  // Read from snapshot, not live buffer
         vec3 rel = L - P;
 
         // Planar target: average of neighbor positions (paper formula)
@@ -84,18 +92,39 @@ void main() {
         
         // Spring target: for each link, target position is neighbor + restLength * direction from neighbor to cell
         // Paper: springTarget = 1/n * sum(Lr + linkRestLength * normalize(P - Lr))
-        // Note: normalize(P - L) is direction FROM neighbor L TO cell P
-        vec3 dirFromNeighborToCell = safeNormalize(P - L, radialFallback);
+        vec3 dirFromNeighborToCell = safeNormalize(P - L, vec3(0.0, 1.0, 0.0));
         springTarget += L + linkRestLength * dirFromNeighborToCell;
 
         neighborIDs[validCount] = neighborIndex;
         neighborRel[validCount] = rel;
+        neighborCentroidHint += rel;
         validCount++;
     }
 
-    if (validCount > 0) {
+    // If no valid neighbors, skip all force computation — keep cell at P.
+    // This prevents isolated cells from drifting toward the origin because
+    // springTarget/planarTarget default to zero.
+    if (validCount == 0) {
+        // Still update voxel coords for the cell's current position.
+        cells[id].voxelCoord = floor(P / voxelSize);
+        ivec3 voxel_offset = ivec3(gridResolution) / 2;
+        ivec3 shiftedVoxel = ivec3(cells[id].voxelCoord) + voxel_offset;
+        if (any(lessThan(shiftedVoxel, ivec3(0))) || any(greaterThanEqual(shiftedVoxel, ivec3(gridResolution)))) {
+            cells[id].flatVoxelIndex = -1;
+        } else {
+            cells[id].flatVoxelIndex = int(shiftedVoxel.x +
+                                      shiftedVoxel.y * gridResolution.x +
+                                      shiftedVoxel.z * gridResolution.x * gridResolution.y);
+        }
+        return;
+    }
+
+    vec3 localOutwardHint;
+    {
         planarTarget /= float(validCount);
         springTarget /= float(validCount);
+        neighborCentroidHint /= float(validCount);
+        localOutwardHint = safeNormalize(-neighborCentroidHint, vec3(0.0, 1.0, 0.0));
     }
 
     // Paper-style local normal from pairs of linked neighbors around P.
@@ -113,14 +142,13 @@ void main() {
     }
 
     if (normalPairCount > 0) {
-        if (dot(normalSum, radialFallback) < 0.0) {
+        if (dot(normalSum, localOutwardHint) < 0.0) {
             normalSum = -normalSum;
         }
-        normal = safeNormalize(normalSum, radialFallback);
-    } else if (validCount > 0) {
-        normal = safeNormalize(P - planarTarget, radialFallback);
+        normal = safeNormalize(normalSum, localOutwardHint);
     } else {
-        normal = radialFallback;
+        // validCount > 0 guaranteed (we returned early if 0).
+        normal = safeNormalize(P - planarTarget, localOutwardHint);
     }
 
     // Bulge target from intersections of P's normal with rest-length spheres around neighbor pairs.
@@ -180,7 +208,7 @@ void main() {
             }
 
             bool isDirect = false;
-            for (int j = 0; j < 6; ++j) {
+            for (int j = 0; j < MAX_NEIGHBORS; ++j) {
                 if (links[linkBase + j] == candidate) {
                     isDirect = true;
                     break;
@@ -190,7 +218,7 @@ void main() {
                 continue;
             }
 
-            vec3 diff = P - cells[candidate].position;
+            vec3 diff = P - posSnapshot[candidate].xyz;  // Read from snapshot
             float dist2 = dot(diff, diff);
             if (dist2 < roiSquared && dist2 > 1e-8) {
                 collisionOffset += repulsionFactor * ((roiSquared - dist2) / roiSquared) * normalize(diff);

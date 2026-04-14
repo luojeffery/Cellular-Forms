@@ -32,7 +32,7 @@ void main() {
     int linkBase = cells[id].linkStartIndex;
     int count = 0;
 
-    for (int i = 0; i < 6; i++) {
+    for (int i = 0; i < 8; i++) {
         if (links[linkBase + i] != EMPTY) {
             count++;
         }
